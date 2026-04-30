@@ -18,3 +18,14 @@ services:
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
+      # WhatsApp (UAZAPI): base do servidor + token da instância (não o admin token).
+      - key: UAZAPI_BASE_URL
+        sync: false
+      - key: UAZAPI_INSTANCE_TOKEN
+        sync: false
+      # Opcional: mesmo valor num header X-UAZAPI-WEBHOOK-Secret nas chamadas do webhook.
+      - key: UAZAPI_WEBHOOK_SECRET
+        sync: false
+      # Opcional: "true" para responder em grupos (usa JID completo em send/text).
+      - key: UAZAPI_ALLOW_GROUPS
+        sync: false

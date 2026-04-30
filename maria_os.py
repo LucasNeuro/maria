@@ -5,7 +5,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from fastapi.responses import RedirectResponse
+from fastapi import Request
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from agno.agent import Agent
 from agno.db.postgres import PostgresDb
@@ -14,6 +15,7 @@ from agno.os import AgentOS
 from agno.os.settings import AgnoAPISettings
 
 from tools_maria import calcular_potencial_sdr, obter_fatos_do_anuncio, registrar_lead_rascunho
+from uazapi_webhook import handle_uazapi_whatsapp_event
 
 load_dotenv()
 
@@ -134,3 +136,14 @@ app = agent_os.get_app()
 async def redirect_swagger() -> RedirectResponse:
     """Atalho: a raiz / é só metadata JSON; o Swagger do AgentOS fica em /docs."""
     return RedirectResponse(url="/docs")
+
+
+@app.post("/webhooks/uazapi")
+async def uazapi_whatsapp_webhook(request: Request) -> JSONResponse:
+    """Recebe eventos UAZAPI (`messages`). Configure na consola: excludeMessages `wasSentByApi`."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid_json"}, status_code=400)
+    status, payload = await handle_uazapi_whatsapp_event(request, maria, body)
+    return JSONResponse(payload, status_code=status)

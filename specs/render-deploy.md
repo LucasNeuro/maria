@@ -16,6 +16,9 @@ No menu **+ New** da Render usa **Blueprint** (com `render.yaml`) ou **Web Servi
 ## Opção A — Blueprint (`render.yaml`)
 
 1. Faz **push** deste repo com `render.yaml` e `Dockerfile` na raiz.
+
+   **Se aparecer** “Blueprint file was found, but there was an issue”: voltaste a fazer **push** do `render.yaml` corrigido e **Retry** no wizard. Causa frequente em YAML: valores com **`:`** (ex. `mistral:modelo`) **sem aspas** quebram o ficheiro — no nosso blueprint o `MARIA_MODEL` já vai entre aspas.
+
 2. Na Render: **New +** → **Blueprint**.
 3. Liga o repositório e aplica o blueprint.
 4. No serviço **mari-agentos** → **Environment**:

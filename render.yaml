@@ -1,0 +1,26 @@
+# Blueprint Render — https://render.com/docs/blueprint-spec
+# Após ligar o repo: Dashboard → New → Blueprint → escolhe este ficheiro (ou deixa na raiz para deteção automática).
+# Define MISTRAL_API_KEY em Environment (secret) antes ou depois do primeiro deploy.
+
+services:
+  - type: web
+    name: mari-agentos
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: MARIA_MODEL
+        value: mistral:mistral-small-latest
+      - key: MISTRAL_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      # Opcional: sessões Agno em Postgres Supabase (Settings → Database → URI)
+      # - key: DATABASE_URL
+      #   sync: false
+      # Opcional: proteger rotas AgentOS (painel tem de enviar o mesmo Bearer)
+      # - key: OS_SECURITY_KEY
+      #   sync: false

@@ -1,0 +1,15 @@
+services:
+  mari-agentos:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # POP editável sem rebuild
+      - ./specs:/app/specs:ro
+      # Leads JSONL (tools_maria); SQLite agno.db fica no container até remover o compose
+      - maria-data:/app/data
+
+volumes:
+  maria-data:

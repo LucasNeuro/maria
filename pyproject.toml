@@ -1,0 +1,16 @@
+[project]
+name = "hub-maria"
+version = "0.1.0"
+description = "Agente Mari (HUB Obra 10+) — Agno + AgentOS"
+requires-python = ">=3.11"
+dependencies = [
+    "agno[os]>=2.2.0",
+    "python-dotenv>=1.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["maria_os", "tools_maria"]

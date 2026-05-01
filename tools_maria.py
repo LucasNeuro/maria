@@ -8,6 +8,7 @@ import mimetypes
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote, urlparse
 from uuid import UUID, uuid4
 
@@ -161,6 +162,11 @@ def persist_conversation_turn_supabase(
             user_has_signal = True
         imgs = user_payload.get("images")
         if isinstance(imgs, list) and any(str(x).strip() for x in imgs):
+            user_has_signal = True
+        if user_payload.get("audio_received") is True:
+            user_has_signal = True
+        docs = user_payload.get("documents")
+        if isinstance(docs, list) and len(docs) > 0:
             user_has_signal = True
     if not user_has_signal or not str(ar or "").strip():
         return False, "user_payload sem texto/localização/imagens ou assistant_payload.text vazio"
@@ -336,11 +342,43 @@ def contexto_lead_por_telefone(telefone: str, max_turnos: int = 25, max_leads: i
                 "dados": _json_preview(r.get("dados")),
             }
 
+        imoveis_ctx: list[dict] = []
+        try:
+            imovel_resp = (
+                client.table("mari_imoveis")
+                .select(
+                    "id,updated_at,status,tipo_imovel,operacao,condicao_imovel,"
+                    "metragem_total_m2,cidade,uf,valor_pretendido_reais"
+                )
+                .in_("phone_e164", variants[:24])
+                .order("updated_at", desc=True)
+                .limit(5)
+                .execute()
+            )
+            for ir in imovel_resp.data or []:
+                imoveis_ctx.append(
+                    {
+                        "id": str(ir.get("id")) if ir.get("id") else None,
+                        "updated_at": str(ir.get("updated_at")),
+                        "status": ir.get("status"),
+                        "tipo_imovel": ir.get("tipo_imovel"),
+                        "operacao": ir.get("operacao"),
+                        "condicao_imovel": ir.get("condicao_imovel"),
+                        "metragem_total_m2": ir.get("metragem_total_m2"),
+                        "cidade": ir.get("cidade"),
+                        "uf": ir.get("uf"),
+                        "valor_pretendido_reais": ir.get("valor_pretendido_reais"),
+                    }
+                )
+        except Exception as exc:
+            logger.warning("contexto: mari_imoveis omitido (%s)", exc)
+
         out = {
             "telefone_normalizado": phone,
             "variantes_consulta": variants,
             "leads_encontrados": len(matched_leads),
             "leads": [pack_lead(x) for x in matched_leads],
+            "imoveis_cadastro": imoveis_ctx,
             "turnos_recentes_count": len(turn_rows),
             "turnos_recentes": [pack_turn(x) for x in turn_rows],
         }
@@ -348,6 +386,48 @@ def contexto_lead_por_telefone(telefone: str, max_turnos: int = 25, max_leads: i
     except Exception as exc:  # noqa: BLE001
         logger.warning("contexto_lead_por_telefone falhou: %s", exc, exc_info=True)
         return json.dumps({"erro": str(exc)}, ensure_ascii=False)
+
+
+def enviar_menu_interativo_uazapi(menu_json: str, numero: str = "") -> str:
+    """
+    Envia **menu interativo** no WhatsApp (botões, lista, enquete ou carrossel) via UAZAPI ``POST /send/menu``.
+
+    menu_json: objeto JSON em string com ``type`` = ``button`` | ``list`` | ``poll`` | ``carousel``, ``text``, ``choices`` (array).
+    Botões de resposta: cada item como ``"Texto visível|id_interno"`` (ver spec UAZAPI em ``specs/uazapi-openapi-spec``).
+    Para ``type=list`` podes usar ``listButton`` e secções ``"[Título]"`` nas choices.
+
+    numero: se vazio, usa o telefone do contexto (webhook WhatsApp).
+    """
+    from uazapi_client import build_send_menu_body, uazapi_configured, uazapi_post_json
+
+    if not uazapi_configured():
+        return json.dumps({"ok": False, "erro": "UAZAPI_BASE_URL ou UAZAPI_INSTANCE_TOKEN não configurados"}, ensure_ascii=False)
+    try:
+        spec = json.loads(menu_json) if (menu_json or "").strip() else {}
+    except json.JSONDecodeError:
+        return json.dumps({"ok": False, "erro": "menu_json não é JSON válido"}, ensure_ascii=False)
+    if not isinstance(spec, dict):
+        return json.dumps({"ok": False, "erro": "menu_json deve ser um objeto JSON"}, ensure_ascii=False)
+
+    ctx = get_lead_context() or {}
+    num = (numero or "").strip() or str(ctx.get("telefone_whatsapp") or "").strip()
+    if not num:
+        return json.dumps(
+            {"ok": False, "erro": "numero vazio — passe no Studio ou use no WhatsApp com contexto."},
+            ensure_ascii=False,
+        )
+    body = build_send_menu_body(num, spec)
+    if not body:
+        return json.dumps(
+            {"ok": False, "erro": "campos inválidos — precisa type, text e choices (non-empty)"},
+            ensure_ascii=False,
+        )
+    try:
+        out = uazapi_post_json("send/menu", body, timeout=120.0)
+        return json.dumps({"ok": True, "uazapi": out}, ensure_ascii=False, default=str)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("enviar_menu_interativo_uazapi: %s", exc, exc_info=True)
+        return json.dumps({"ok": False, "erro": str(exc)}, ensure_ascii=False)
 
 
 def solicitar_localizacao_whatsapp(texto_para_cliente: str, numero: str = "") -> str:
@@ -565,6 +645,558 @@ def registar_midia_url_no_lead(
     except Exception as exc:  # noqa: BLE001
         logger.warning("registar_midia_url_no_lead falhou: %s", exc, exc_info=True)
         return json.dumps({"ok": False, "erro": str(exc)}, ensure_ascii=False)
+
+
+def _norm_imovel_operacao(v: object) -> str | None:
+    if v is None or v is False:
+        return None
+    s = str(v).strip().lower().replace("locação", "locacao").replace(" ", "_")
+    if s in ("venda",):
+        return "venda"
+    if s in ("locacao", "aluguel", "aluguer"):
+        return "locacao"
+    if s in ("venda_e_locacao", "venda_elocacao", "venda+locacao"):
+        return "venda_e_locacao"
+    if "venda" in s and "loc" in s:
+        return "venda_e_locacao"
+    return None
+
+
+def _norm_imovel_condicao(v: object) -> str | None:
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if s in ("novo", "usado", "na_planta", "em_construcao"):
+        return s
+    if s in ("na planta", "em construção", "em construcao"):
+        s2 = s.replace(" ", "_").replace("ç", "c").replace("ã", "a")
+        if s2 == "em_construcao":
+            return "em_construcao"
+        if "planta" in s:
+            return "na_planta"
+    return None
+
+
+def _to_float_opt(v: object) -> float | None:
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int_opt(v: object) -> int | None:
+    if v is None or v == "":
+        return None
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_bool_opt(v: object) -> bool | None:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "sim", "s"):
+        return True
+    if s in ("0", "false", "no", "não", "nao", "n"):
+        return False
+    return None
+
+
+def _imovel_patch_from_dict(raw: dict) -> dict[str, object]:
+    """Campos permitidos para insert/update em public.mari_imoveis."""
+    out: dict[str, object] = {}
+    str_fields = (
+        "tipo_imovel",
+        "endereco_completo",
+        "cep",
+        "logradouro",
+        "numero",
+        "complemento",
+        "bairro",
+        "cidade",
+        "uf",
+        "descricao_livre",
+        "notas_internas",
+    )
+    for k in str_fields:
+        if k not in raw:
+            continue
+        v = raw[k]
+        if v is None:
+            out[k] = None
+        else:
+            t = str(v).strip()
+            out[k] = t if t else None
+    if "uf" in out and isinstance(out["uf"], str) and out["uf"]:
+        out["uf"] = out["uf"][:2].upper()
+
+    if "operacao" in raw:
+        no = _norm_imovel_operacao(raw["operacao"])
+        if no:
+            out["operacao"] = no
+    if "condicao_imovel" in raw:
+        nc = _norm_imovel_condicao(raw["condicao_imovel"])
+        if nc:
+            out["condicao_imovel"] = nc
+
+    for k in ("metragem_total_m2", "metragem_util_m2", "valor_pretendido_reais", "condominio_reais", "iptu_reais"):
+        if k in raw:
+            out[k] = _to_float_opt(raw[k])
+
+    for k in ("quartos", "banheiros", "vagas_garagem"):
+        if k in raw:
+            out[k] = _to_int_opt(raw[k])
+
+    if "latitude" in raw:
+        out["latitude"] = _to_float_opt(raw["latitude"])
+    if "longitude" in raw:
+        out["longitude"] = _to_float_opt(raw["longitude"])
+
+    if "mobiliado" in raw:
+        out["mobiliado"] = _to_bool_opt(raw["mobiliado"])
+    if "aceita_permuta" in raw:
+        out["aceita_permuta"] = _to_bool_opt(raw["aceita_permuta"])
+
+    if "extras" in raw and raw["extras"] is not None:
+        ex = raw["extras"]
+        if isinstance(ex, dict):
+            out["extras"] = ex
+
+    if "status" in raw and raw["status"] is not None:
+        st = str(raw["status"]).strip().lower()
+        if st in ("rascunho", "pendente_validacao", "publicado", "arquivado"):
+            out["status"] = st
+
+    if "lead_id" in raw and raw["lead_id"]:
+        lid = str(raw["lead_id"]).strip()
+        try:
+            UUID(lid)
+            out["lead_id"] = lid
+        except ValueError:
+            pass
+
+    return out
+
+
+def _imovel_rows_for_phone(client: object, variants: list[str], *, limit: int) -> list[dict]:
+    try:
+        resp = (
+            client.table("mari_imoveis")
+            .select(
+                "id,created_at,updated_at,status,phone_e164,tipo_imovel,operacao,condicao_imovel,"
+                "metragem_total_m2,cidade,uf,valor_pretendido_reais,lead_id"
+            )
+            .in_("phone_e164", variants[:24])
+            .order("updated_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return list(resp.data or [])
+    except Exception as exc:
+        logger.warning("mari_imoveis list falhou (tabela criada?): %s", exc)
+        return []
+
+
+def _imovel_id_belongs_to_phone(client: object, imovel_id: str, variants: list[str]) -> bool:
+    try:
+        resp = (
+            client.table("mari_imoveis")
+            .select("id,phone_e164")
+            .eq("id", imovel_id)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        if not rows:
+            return False
+        ph = str(rows[0].get("phone_e164") or "")
+        if ph in variants:
+            return True
+        return any(_same_contact_phone(ph, v) for v in variants)
+    except Exception:
+        return False
+
+
+def salvar_rascunho_imovel(dados_json: str = "{}", imovel_id: str = "") -> str:
+    """
+    Cria ou atualiza um **rascunho de imóvel** em ``public.mari_imoveis`` (Supabase).
+    Usa o telefone do contexto (WhatsApp) como ``phone_e164``. Execute o SQL ``mari_imoveis.sql`` antes.
+
+    dados_json: objeto JSON com campos opcionais, ex.:
+    ``tipo_imovel``, ``operacao`` (venda|locacao|venda_e_locacao), ``condicao_imovel`` (novo|usado|na_planta|em_construcao),
+    ``metragem_total_m2``, ``metragem_util_m2``, ``quartos``, ``banheiros``, ``vagas_garagem``,
+    ``cep``, ``logradouro``, ``numero``, ``complemento``, ``bairro``, ``cidade``, ``uf``, ``endereco_completo``,
+    ``latitude``, ``longitude``, ``valor_pretendido_reais``, ``condominio_reais``, ``iptu_reais``,
+    ``descricao_livre``, ``mobiliado``, ``aceita_permuta``, ``extras`` (objeto), ``lead_id`` (uuid), ``status``.
+    imovel_id: se vazio, insere novo rascunho; caso contrário atualiza esse id (tem de ser do mesmo contacto).
+    """
+    if not _supabase_configured():
+        return json.dumps({"ok": False, "erro": "Supabase não configurado"}, ensure_ascii=False)
+    try:
+        from supabase import create_client
+    except ImportError:
+        return json.dumps({"ok": False, "erro": "pacote supabase não instalado"}, ensure_ascii=False)
+
+    ctx = get_lead_context() or {}
+    phone_raw = str(ctx.get("telefone_whatsapp") or "").strip()
+    phone_digits = _digits_only(phone_raw)
+    if not phone_digits:
+        return json.dumps(
+            {"ok": False, "erro": "Telefone ausente no contexto — use no WhatsApp ou passe sessão com telefone."},
+            ensure_ascii=False,
+        )
+    variants = _phone_variants_for_query(phone_digits)
+    seg_phone = variants[0] if variants else phone_digits[:32]
+
+    try:
+        raw = json.loads(dados_json) if dados_json else {}
+    except json.JSONDecodeError:
+        return json.dumps({"ok": False, "erro": "dados_json inválido"}, ensure_ascii=False)
+    if not isinstance(raw, dict):
+        return json.dumps({"ok": False, "erro": "dados_json deve ser objeto JSON"}, ensure_ascii=False)
+
+    patch = _imovel_patch_from_dict(raw)
+    client = create_client(
+        os.environ["SUPABASE_URL"].strip(),
+        os.environ["SUPABASE_SERVICE_ROLE_KEY"].strip(),
+    )
+
+    iid = (imovel_id or "").strip()
+    if iid:
+        try:
+            UUID(iid)
+        except ValueError:
+            return json.dumps({"ok": False, "erro": "imovel_id não é UUID válido"}, ensure_ascii=False)
+        if not _imovel_id_belongs_to_phone(client, iid, variants):
+            return json.dumps(
+                {"ok": False, "erro": "imovel_id não encontrado ou não pertence a este contacto"},
+                ensure_ascii=False,
+            )
+        if not patch:
+            row_one = (
+                client.table("mari_imoveis")
+                .select(
+                    "id,status,tipo_imovel,operacao,condicao_imovel,metragem_total_m2,cidade,uf,valor_pretendido_reais"
+                )
+                .eq("id", iid)
+                .limit(1)
+                .execute()
+            )
+            data = (row_one.data or [{}])[0]
+            return json.dumps({"ok": True, "acao": "nada_a_atualizar", "imovel": data}, ensure_ascii=False, default=str)
+        upd = client.table("mari_imoveis").update(patch).eq("id", iid).execute()
+        row = (upd.data or [{}])[0] if upd.data else {}
+        return json.dumps({"ok": True, "acao": "atualizado", "imovel_id": iid, "imovel": row}, ensure_ascii=False, default=str)
+
+    row_ins: dict[str, object] = {"phone_e164": seg_phone[:64]}
+    row_ins.update(patch)
+    ins = client.table("mari_imoveis").insert(row_ins).execute()
+    new_row = (ins.data or [{}])[0]
+    nid = new_row.get("id")
+    return json.dumps(
+        {"ok": True, "acao": "criado", "imovel_id": str(nid) if nid else None, "imovel": new_row},
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def listar_imoveis_contato(telefone: str = "", limite: int = 8) -> str:
+    """
+    Lista rascunhos/registos de ``mari_imoveis`` para o telefone (contexto WhatsApp se ``telefone`` vazio).
+    """
+    if not _supabase_configured():
+        return json.dumps({"ok": False, "erro": "Supabase não configurado"}, ensure_ascii=False)
+    try:
+        from supabase import create_client
+    except ImportError:
+        return json.dumps({"ok": False, "erro": "pacote supabase não instalado"}, ensure_ascii=False)
+
+    phone_raw = (telefone or "").strip()
+    if not phone_raw:
+        ctx = get_lead_context() or {}
+        phone_raw = str(ctx.get("telefone_whatsapp") or "").strip()
+    phone_digits = _digits_only(phone_raw)
+    if not phone_digits:
+        return json.dumps({"ok": False, "erro": "telefone vazio"}, ensure_ascii=False)
+    variants = _phone_variants_for_query(phone_digits)
+    try:
+        lim = int(limite)
+    except (TypeError, ValueError):
+        lim = 8
+    lim = max(1, min(lim, 30))
+
+    client = create_client(
+        os.environ["SUPABASE_URL"].strip(),
+        os.environ["SUPABASE_SERVICE_ROLE_KEY"].strip(),
+    )
+    rows = _imovel_rows_for_phone(client, variants, limit=lim)
+    return json.dumps(
+        {"ok": True, "count": len(rows), "imoveis": rows},
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def anexar_midia_imovel(
+    url_midia: str,
+    imovel_id: str,
+    legenda: str = "",
+    nome_arquivo_sugerido: str = "",
+    content_type: str = "",
+) -> str:
+    """
+    Descarrega uma URL HTTPS (ex. ficheiro WhatsApp), envia para o Storage Supabase e regista em
+    ``public.mari_imovel_midia`` ligado ao ``imovel_id``. O imóvel tem de pertencer ao telefone do contexto.
+    """
+    if not _supabase_configured():
+        return json.dumps({"ok": False, "erro": "Supabase não configurado"}, ensure_ascii=False)
+    iid = (imovel_id or "").strip()
+    try:
+        UUID(iid)
+    except ValueError:
+        return json.dumps({"ok": False, "erro": "imovel_id inválido"}, ensure_ascii=False)
+
+    ctx = get_lead_context() or {}
+    phone_raw = str(ctx.get("telefone_whatsapp") or "").strip()
+    phone_digits = _digits_only(phone_raw)
+    if not phone_digits:
+        return json.dumps({"ok": False, "erro": "Telefone ausente no contexto"}, ensure_ascii=False)
+    variants = _phone_variants_for_query(phone_digits)
+
+    url = (url_midia or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return json.dumps({"ok": False, "erro": "url_midia deve ser http(s)"}, ensure_ascii=False)
+
+    try:
+        from supabase import create_client
+    except ImportError:
+        return json.dumps({"ok": False, "erro": "pacote supabase não instalado"}, ensure_ascii=False)
+
+    client = create_client(
+        os.environ["SUPABASE_URL"].strip(),
+        os.environ["SUPABASE_SERVICE_ROLE_KEY"].strip(),
+    )
+    if not _imovel_id_belongs_to_phone(client, iid, variants):
+        return json.dumps(
+            {"ok": False, "erro": "imovel_id não encontrado ou não pertence a este contacto"},
+            ensure_ascii=False,
+        )
+
+    max_b = _media_max_bytes()
+    bucket = (os.getenv("MARIA_STORAGE_BUCKET") or "maria-lead-media").strip()
+    try:
+        with httpx.Client(timeout=120.0, follow_redirects=True) as hc:
+            r = hc.get(url)
+            r.raise_for_status()
+            body = r.content
+        if len(body) > max_b:
+            return json.dumps({"ok": False, "erro": f"ficheiro maior que {max_b} bytes"}, ensure_ascii=False)
+
+        mime = (content_type or "").strip() or r.headers.get("content-type", "").split(";")[0].strip()
+        if not mime:
+            mime, _ = mimetypes.guess_type(_filename_for_media(url, nome_arquivo_sugerido))
+        mime = mime or "application/octet-stream"
+
+        fname = _filename_for_media(url, nome_arquivo_sugerido)
+        uid = uuid4().hex[:12]
+        object_path = f"imovel/{iid}/{uid}_{_storage_safe_segment(fname, 160)}"
+        file_opts = {"content-type": mime, "upsert": "false"}
+        client.storage.from_(bucket).upload(object_path, body, file_opts)
+
+        row = {
+            "imovel_id": iid,
+            "phone_e164": _storage_safe_segment(phone_digits, 32),
+            "storage_bucket": bucket,
+            "object_path": object_path,
+            "source_url": url[:2048],
+            "content_type": mime[:200],
+            "bytes_size": len(body),
+            "legenda": (legenda or "").strip()[:2000] or None,
+            "metadata": {},
+        }
+        ins = client.table("mari_imovel_midia").insert(row).execute()
+        signed_url: str | None = None
+        try:
+            sign = client.storage.from_(bucket).create_signed_url(object_path, 604800)
+            signed_url = sign.get("signedURL") or sign.get("signedUrl")
+        except Exception:
+            pass
+        out = {
+            "ok": True,
+            "id": (ins.data or [{}])[0].get("id") if ins.data else None,
+            "imovel_id": iid,
+            "bucket": bucket,
+            "object_path": object_path,
+            "signed_url_7d": signed_url,
+            "bytes_size": len(body),
+        }
+        return json.dumps(out, ensure_ascii=False, default=str)
+    except Exception as exc:
+        logger.warning("anexar_midia_imovel falhou: %s", exc, exc_info=True)
+        return json.dumps({"ok": False, "erro": str(exc)}, ensure_ascii=False)
+
+
+def _extension_for_image_mime(mime: str) -> str:
+    base = (mime or "").split(";")[0].strip().lower()
+    tab = {
+        "image/jpeg": "jpg",
+        "image/jpg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+        "image/gif": "gif",
+    }
+    return tab.get(base, "jpg")
+
+
+def _attach_uazapi_media_to_latest_imovel() -> bool:
+    return os.getenv("MARIA_ATTACH_UAZAPI_MEDIA_TO_LATEST_IMOVEL", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def persist_uazapi_downloaded_images_sync(
+    phone_e164: str,
+    images: list[Any],
+    wa_message_id: str | None = None,
+) -> str:
+    """
+    Grava no Storage + ``mari_lead_media`` imagens já obtidas via UAZAPI ``message/download``
+    (Agno ``Image`` com ``content`` em bytes). Usado pelo webhook WhatsApp — **não** precisa de URL pública.
+
+    Desliga com ``MARIA_PERSIST_UAZAPI_DOWNLOAD_MEDIA=0``. Tipo de lead no CRM: ``MARIA_INBOUND_DOWNLOAD_MEDIA_TIPO_LEAD``
+    (default ``proprietario``). Com ``MARIA_ATTACH_UAZAPI_MEDIA_TO_LATEST_IMOVEL=1`` também insere em
+    ``mari_imovel_midia`` quando existir rascunho recente do contacto.
+    """
+    if not _supabase_configured():
+        return json.dumps({"ok": False, "skipped": True, "motivo": "supabase_desligado"}, ensure_ascii=False)
+    if os.getenv("MARIA_PERSIST_UAZAPI_DOWNLOAD_MEDIA", "1").strip().lower() in ("0", "false", "no", "off"):
+        return json.dumps(
+            {"ok": True, "skipped": True, "motivo": "MARIA_PERSIST_UAZAPI_DOWNLOAD_MEDIA=0"},
+            ensure_ascii=False,
+        )
+
+    phone_digits = _digits_only(phone_e164 or "")
+    if not phone_digits:
+        return json.dumps({"ok": False, "erro": "phone_e164 vazio"}, ensure_ascii=False)
+
+    tipo_raw = (os.getenv("MARIA_INBOUND_DOWNLOAD_MEDIA_TIPO_LEAD") or "proprietario").strip()
+    tipo = _normalize_tipo_lead(tipo_raw) or "proprietario"
+
+    try:
+        from supabase import create_client
+    except ImportError:
+        return json.dumps({"ok": False, "erro": "supabase não instalado"}, ensure_ascii=False)
+
+    max_b = _media_max_bytes()
+    bucket = (os.getenv("MARIA_STORAGE_BUCKET") or "maria-lead-media").strip()
+    variants = _phone_variants_for_query(phone_digits)
+    seg_phone = _storage_safe_segment(phone_digits, 24)
+    seg_tipo = _storage_safe_segment(tipo, 24)
+    mid = (wa_message_id or "").strip() or "sem_id"
+    mid_seg = _storage_safe_segment(mid, 64)
+
+    client = create_client(
+        os.environ["SUPABASE_URL"].strip(),
+        os.environ["SUPABASE_SERVICE_ROLE_KEY"].strip(),
+    )
+    lid_resolved = _resolve_lead_uuid(client, phone_digits, "")
+
+    imovel_latest: str | None = None
+    if _attach_uazapi_media_to_latest_imovel():
+        rows = _imovel_rows_for_phone(client, variants, limit=1)
+        if rows and rows[0].get("id"):
+            imovel_latest = str(rows[0]["id"])
+
+    saved: list[dict[str, Any]] = []
+    for img in images or []:
+        content = getattr(img, "content", None)
+        if not isinstance(content, (bytes, bytearray)) or len(content) == 0:
+            continue
+        body = bytes(content)
+        if len(body) > max_b:
+            logger.warning("persist_uazapi_download: skip oversized | bytes=%s", len(body))
+            continue
+        mime = getattr(img, "mime_type", None) or ""
+        mime = str(mime).split(";")[0].strip() or "image/jpeg"
+        if not mime.startswith("image/"):
+            mime = "image/jpeg"
+        ext = _extension_for_image_mime(mime)
+        uid = uuid4().hex[:12]
+        object_path = f"uazapi_dl/{seg_tipo}/{seg_phone}/{mid_seg}_{uid}.{ext}"
+        try:
+            file_opts = {"content-type": mime, "upsert": "false"}
+            client.storage.from_(bucket).upload(object_path, body, file_opts)
+        except Exception as exc:
+            logger.warning("persist_uazapi_download: upload falhou | path=%s | err=%s", object_path, exc)
+            continue
+
+        meta: dict[str, Any] = {"source": "uazapi_message_download"}
+        if mid != "sem_id":
+            meta["wa_message_id"] = mid
+        row_lead = {
+            "phone_e164": seg_phone[:32],
+            "lead_id": lid_resolved,
+            "tipo_lead": tipo,
+            "storage_bucket": bucket,
+            "object_path": object_path,
+            "source_url": None,
+            "content_type": mime[:200],
+            "bytes_size": len(body),
+            "notas": "auto webhook (message/download)",
+            "metadata": meta,
+        }
+        lid_media = None
+        try:
+            ins_lead = client.table("mari_lead_media").insert(row_lead).execute()
+            lid_media = (ins_lead.data or [{}])[0].get("id") if ins_lead.data else None
+        except Exception as exc:
+            logger.warning("persist_uazapi_download: mari_lead_media insert | err=%s", exc)
+
+        im_mid: str | None = None
+        if imovel_latest:
+            try:
+                meta_im: dict[str, Any] = {"source": "uazapi_message_download"}
+                if lid_media:
+                    meta_im["mari_lead_media_id"] = str(lid_media)
+                row_im = {
+                    "imovel_id": imovel_latest,
+                    "phone_e164": seg_phone[:32],
+                    "storage_bucket": bucket,
+                    "object_path": object_path,
+                    "source_url": None,
+                    "content_type": mime[:200],
+                    "bytes_size": len(body),
+                    "legenda": None,
+                    "metadata": meta_im,
+                }
+                ins_im = client.table("mari_imovel_midia").insert(row_im).execute()
+                im_mid = (ins_im.data or [{}])[0].get("id") if ins_im.data else None
+            except Exception as exc:
+                logger.warning("persist_uazapi_download: mari_imovel_midia | err=%s", exc)
+
+        saved.append(
+            {
+                "mari_lead_media_id": str(lid_media) if lid_media else None,
+                "mari_imovel_midia_id": str(im_mid) if im_mid else None,
+                "object_path": object_path,
+                "bytes_size": len(body),
+            }
+        )
+
+    return json.dumps(
+        {"ok": True, "count": len(saved), "imovel_id_attached": imovel_latest, "items": saved},
+        ensure_ascii=False,
+        default=str,
+    )
 
 
 def obter_detalhes_chat_uazapi(numero: str, preview_imagem: bool = False) -> str:

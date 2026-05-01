@@ -25,7 +25,7 @@ Este documento junta **onde criar o quê** e **que chaves** pões na Render.
 ## Fluxo Supabase (projeto)
 
 1. Cria projeto em [supabase.com](https://supabase.com).
-2. No **SQL Editor**, executa o script [`supabase/sql/leads.sql`](../supabase/sql/leads.sql) (cria a tabela `public.leads`).
+2. No **SQL Editor**, executa por ordem (ou de uma vez): [`supabase/sql/leads.sql`](../supabase/sql/leads.sql), [`supabase/sql/mari_conversation_turns.sql`](../supabase/sql/mari_conversation_turns.sql), [`supabase/sql/mari_lead_media.sql`](../supabase/sql/mari_lead_media.sql), e — para cadastro estruturado de imóveis — [`supabase/sql/mari_imoveis.sql`](../supabase/sql/mari_imoveis.sql).
 3. Em **Project Settings → API** copia:
    - **Project URL** → usar como `SUPABASE_URL` na Render (e localmente no `.env`).
 4. Em **Project Settings → API** copia **`service_role`** (secret):

@@ -20,14 +20,18 @@ from agno.os.settings import AgnoAPISettings
 
 from maria_skills_loader import carregar_skill_maria
 from tools_maria import (
+    anexar_midia_imovel,
     calcular_potencial_sdr,
     consultar_cep_viacep,
     contexto_lead_por_telefone,
+    enviar_menu_interativo_uazapi,
+    listar_imoveis_contato,
     obter_detalhes_chat_uazapi,
     obter_fatos_do_anuncio,
     registrar_lead_rascunho,
     registar_midia_url_no_lead,
     solicitar_localizacao_whatsapp,
+    salvar_rascunho_imovel,
 )
 from maria_admin_api import maybe_add_cors, register_maria_admin_routes
 from uazapi_webhook import handle_uazapi_whatsapp_event
@@ -65,6 +69,23 @@ O servidor pode **comprimir outputs antigos de ferramentas** para caber mais his
 ## Skills (instruções longas — não repetir no POP)
 No final das instruções há um **índice de skills** (pastas em `skills/`). Para fluxos com muitos passos (anexos no Storage, ViaCEP), chama **`carregar_skill_maria`** com o `skill_id` ou vazio para listar.
 
+## Menus interativos no WhatsApp (botões e listas)
+Quando o canal for **WhatsApp** e precisares de respostas guiadas (ex.: corretor → “vender ou alugar?”), usa **uma** destas formas:
+
+1. **Bloco no texto da resposta** (o webhook envia o card automaticamente): depois da tua mensagem curta, inclui **exactamente** isto numa linha nova, JSON válido entre os marcadores:
+`<<<MARIA_MENU_JSON>>>`
+`{"type":"button","text":"Texto principal do card (pergunta)","choices":["Vender imóvel|op_vender","Alugar imóvel|op_alugar","Cadastro / parceria|op_parceiro"],"footerText":"Toque numa opção"}`
+`<<<END_MARIA_MENU_JSON>>>`
+
+- `type`: `button` (até poucos botões de resposta), `list` (menus maiores; inclui `"listButton":"Ver opções"`), `poll` ou `carousel` (avançado — ver spec UAZAPI).
+- Cada botão de resposta: `"Texto que o utilizador vê|id_curto"` — o cliente ao tocar manda o **texto** ou id conforme a UAZAPI; trata a próxima mensagem pelo conteúdo escolhido.
+- Opcional: mensagem **só** com o card (sem texto antes dos marcadores) — o campo `text` do JSON é o corpo do card.
+- **Não** mistures na mesma mensagem botões `call`/`url` com resposta se quiseres evitar aviso no WhatsApp Web (ver documentação UAZAPI).
+
+2. **Ferramenta** **`enviar_menu_interativo_uazapi(menu_json, numero="")`** — mesmo JSON numa string; envia **só** o card (mensagem separada). Evita duplicar texto do card na tua resposta em prosa.
+
+No **AgentOS / chat sem WhatsApp**, o bloco `<<<MARIA_MENU_JSON>>>` não tem efeito visual — prefere texto normal ou a ferramenta não será usada em canais sem UAZAPI.
+
 ## Fluxo 1 — Cliente final (compra/locação)
 Segue a **sequência 7.1** quando fizer sentido; adapta se o cliente já antecipar passos.
 - Trata **perguntas diretas** conforme **7.2** e **secção 10** (sempre curto).
@@ -76,19 +97,21 @@ Segue a **sequência 7.1** quando fizer sentido; adapta se o cliente já antecip
 Segue **8.1** e coleta **8.2** (nome, telefone, operação, cidade/bairro, tamanho, valor). Opcionais **8.3**.
 - Desconhecido → registar **"Não informado"** e seguir (8.4).
 - Convida a enviar fotos/vídeos quando adequado.
-- Fecho: **`registrar_lead_rascunho`** com `tipo_lead=proprietario` e campos no `dados_json`.
+- **Cadastro estruturado no CRM:** carrega a skill **`cadastro-imoveis`** e usa **`salvar_rascunho_imovel`** (criar/atualizar `mari_imoveis`), **`consultar_cep_viacep`** para endereço, **`anexar_midia_imovel`** para cada foto com URL HTTPS, **`listar_imoveis_contato`** para retomar. Fecho: **`registrar_lead_rascunho`** com `tipo_lead=proprietario` e liga o `imovel_id` no `dados_json` quando existir.
 
 ## Fluxo 3 — Corretor / imobiliária (parceria)
 Segue **9.1**: após nome, pede **e-mail** (obrigatório neste fluxo). Depois **cadastro vs parceria** (9.2 ou 9.3).
-- **`registrar_lead_rascunho`** com `tipo_lead=parceiro`; incluir email e intenção no `dados_json`.
+- Quando o cliente disser que é **corretor** ou **imobiliária**, podes oferecer opções com **menu de botões** (vender, alugar, parceria/cadastro) usando o bloco **MARIA_MENU_JSON** ou a tool **`enviar_menu_interativo_uazapi`**.
+- Se o foco for **cadastrar imóvel** no HUB: mesmas ferramentas que no fluxo 2 (`cadastro-imoveis`, `salvar_rascunho_imovel`, etc.).
+- **`registrar_lead_rascunho`** com `tipo_lead=parceiro`; incluir email e intenção no `dados_json`; incluir `imovel_id` se houver rascunho de imóvel.
 
 ## Nome e cortesia (secções 4–5)
 Nunca ignores o nome. Sempre que informarem o nome (ou corrigirem), **reconhece** e usa a linha de cortesia do POP (*"Obrigado pela informação. É um prazer te atender."* ou variação permitida).
 
 ## Exceções rápidas (secção 14)
 - Nome corrigido → atualiza e reconhece.
-- Áudio → POP diz para considerar e resumir no card; neste canal sem STT, acolhe e pede o essencial por escrito se precisares.
-- Imagem → o runtime pode enviar a imagem ao modelo (visão) quando a UAZAPI expuser URL; descreve o que importa para o imóvel/atendimento sem inventar endereço ou preço.
+- Áudio → o **webhook** responde já com aviso curto de que **ainda não há transcrição** e pede texto; no POP continua a considerar o áudio no registo quando o cliente depois escrever.
+- Imagem → **alinhado ao AgentOS:** com `MARIA_MULTIMODAL_VISION=1` e modelo com **visão**, o webhook passa `images=` ao `arun` como no Studio; descreve o que importa para o imóvel/atendimento **sem inventar** endereço ou preço até o cliente ou ViaCEP confirmarem.
 - Localização → quando o cliente partilhar pin, usa lat/lon e nome do local no raciocínio; não pedir coordenadas manuais se já vieram.
 - Fora do escopo → resposta breve + encaminhar humano.
 - Silêncio → **no máximo 1** follow-up curto (*"Conseguiu ver minha mensagem?"*).
@@ -105,9 +128,13 @@ Nunca ignores o nome. Sempre que informarem o nome (ou corrigirem), **reconhece*
 4. **`obter_detalhes_chat_uazapi(numero, preview_imagem=False)`** — opcional: dados completos do contacto/chat na UAZAPI (`/chat/details`) quando precisares de nome WhatsApp, lead_*, grupo, etc.
 5. **`contexto_lead_por_telefone(telefone, max_turnos=25, max_leads=8)`** — opcional: lê só `public.leads` + `public.mari_conversation_turns` para esse telefone (cliente que regressa, contexto antes de qualificar de novo).
 6. **`solicitar_localizacao_whatsapp(texto_para_cliente, numero="")`** — no **WhatsApp**, envia o botão nativo para o cliente partilhar localização (UAZAPI `/send/location-button`). Usa quando precisares de zona/raio para visitas ou imóveis próximos.
-7. **`carregar_skill_maria(skill_id)`** — lista skills (`skill_id` vazio) ou carrega o Markdown completo (ex.: `midias-leads`, `cep-endereco`).
+7. **`carregar_skill_maria(skill_id)`** — lista skills (`skill_id` vazio) ou carrega o Markdown completo (ex.: `midias-leads`, `cep-endereco`, **`cadastro-imoveis`**).
 8. **`registar_midia_url_no_lead(url_midia, tipo_lead, ...)`** — descarrega URL, grava no **Supabase Storage** e insere `public.mari_lead_media` (telefone no contexto WhatsApp).
 9. **`consultar_cep_viacep(cep)`** — endereço via **ViaCEP** (8 dígitos).
+10. **`salvar_rascunho_imovel(dados_json, imovel_id="")`** — cria/atualiza rascunho em **`public.mari_imoveis`** (requer SQL `mari_imoveis.sql` aplicado).
+11. **`listar_imoveis_contato(telefone="", limite=8)`** — lista rascunhos do contacto (contexto WhatsApp se telefone vazio).
+12. **`anexar_midia_imovel(url_midia, imovel_id, ...)`** — foto/documento por URL → Storage + **`public.mari_imovel_midia`**.
+13. **`enviar_menu_interativo_uazapi(menu_json, numero="")`** — card com botões/lista no WhatsApp (UAZAPI `/send/menu`). Preferir também o bloco **MARIA_MENU_JSON** na resposta para texto + card na mesma interação.
 
 ---
 """
@@ -236,6 +263,10 @@ maria = Agent(
         carregar_skill_maria,
         registar_midia_url_no_lead,
         consultar_cep_viacep,
+        salvar_rascunho_imovel,
+        listar_imoveis_contato,
+        anexar_midia_imovel,
+        enviar_menu_interativo_uazapi,
     ],
     instructions=_instructions(),
     markdown=True,

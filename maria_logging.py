@@ -40,7 +40,44 @@ def quiet_noisy_loggers() -> None:
     logging.getLogger("hpack").setLevel(logging.WARNING)
 
 
-# Configuração consumida por uvicorn.run(..., log_config=UVICORN_RICH_LOG_CONFIG)
+# Render / agregadores: Rich por vezes falha em TTY. Use MARIA_PLAIN_LOGS=1 → log em texto no stderr.
+def get_uvicorn_log_config() -> dict:
+    if os.getenv("MARIA_PLAIN_LOGS", "").strip().lower() not in ("1", "true", "yes", "on"):
+        return UVICORN_RICH_LOG_CONFIG
+    formatter = {
+        "format": "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        "datefmt": "%Y-%m-%d %H:%M:%S",
+    }
+    h = {
+        "class": "logging.StreamHandler",
+        "formatter": "plain",
+        "stream": "ext://sys.stderr",
+    }
+    names = (
+        "uvicorn",
+        "uvicorn.error",
+        "uvicorn.access",
+        "maria",
+        "tools_maria",
+        "uazapi_webhook",
+        "maria_admin_api",
+        "maria_os",
+        "agno",
+    )
+    loggers = {n: {"handlers": ["stderr"], "level": "INFO", "propagate": False} for n in names}
+    loggers["uazapi_client"] = {"handlers": ["stderr"], "level": "WARNING", "propagate": False}
+    loggers["agno"]["level"] = "WARNING"
+    return {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {"plain": formatter},
+        "handlers": {"stderr": h},
+        "loggers": loggers,
+        "root": {"handlers": ["stderr"], "level": "INFO"},
+    }
+
+
+# Configuração consumida por uvicorn.run(..., log_config=get_uvicorn_log_config())
 UVICORN_RICH_LOG_CONFIG: dict = {
     "version": 1,
     "disable_existing_loggers": False,

@@ -23,3 +23,6 @@ create index if not exists leads_created_at_idx on public.leads (created_at desc
 create index if not exists leads_tipo_lead_idx on public.leads (tipo_lead);
 
 comment on table public.leads is 'Leads HUB Obra 10+ registados pela Mari (AgentOS).';
+
+-- A Mari no Render usa SUPABASE_SERVICE_ROLE_KEY (bypass RLS). Sem policies = sem acesso directo anon/auth.
+alter table public.leads enable row level security;

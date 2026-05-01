@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+
+from maria_context import get_lead_context
+
+logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
@@ -22,6 +27,30 @@ def _supabase_configured() -> bool:
     return bool(url and key)
 
 
+_ALLOWED_TIPOS = frozenset({"cliente_final", "proprietario", "parceiro"})
+
+
+def _normalize_tipo_lead(raw: str) -> str | None:
+    t = (raw or "").strip().lower().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "cliente": "cliente_final",
+        "comprador": "cliente_final",
+        "proprietário": "proprietario",
+        "proprietária": "proprietario",
+        "parceira": "parceiro",
+        "corretor": "parceiro",
+        "imobiliaria": "parceiro",
+        "imobiliária": "parceiro",
+    }
+    t = aliases.get(t, t)
+    return t if t in _ALLOWED_TIPOS else None
+
+
+def _non_empty_text(val: object, fallback: str) -> str:
+    s = (str(val).strip() if val is not None else "") or ""
+    return s if s else fallback
+
+
 def _insert_lead_supabase(row: dict, extra: dict) -> tuple[bool, str | None]:
     """Insert na tabela public.leads. Retorna (ok, mensagem_erro)."""
     try:
@@ -29,30 +58,95 @@ def _insert_lead_supabase(row: dict, extra: dict) -> tuple[bool, str | None]:
     except ImportError:
         return False, "pacote supabase não instalado"
 
+    tipo = _normalize_tipo_lead(str(row.get("tipo_lead") or ""))
+    if not tipo:
+        return False, (
+            f"tipo_lead inválido {row.get('tipo_lead')!r} — use exatamente: "
+            "cliente_final | proprietario | parceiro"
+        )
+
+    nome = _non_empty_text(row.get("nome"), "Não informado")
+    telefone = _non_empty_text(row.get("telefone"), "Não informado")
+    resumo = _non_empty_text(row.get("resumo_geral"), "(resumo não informado)")
+    potencial = _non_empty_text(row.get("potencial"), "BAIXO")
+
     try:
         client = create_client(
             os.environ["SUPABASE_URL"].strip(),
             os.environ["SUPABASE_SERVICE_ROLE_KEY"].strip(),
         )
-        payload = {
-            "created_at": row["ts"],
-            "tipo_lead": row["tipo_lead"],
-            "nome": row["nome"],
-            "telefone": row["telefone"],
-            "email": row["email"],
-            "origem": row["origem"],
-            "imovel_interesse": row["imovel_interesse"],
-            "perguntas_resumo": row["perguntas_resumo"],
-            "midias_enviadas": row["midias_enviadas"],
-            "pediu_visita": row["pediu_visita"],
-            "urgencia": row["urgencia"],
-            "potencial": row["potencial"],
-            "resumo_geral": row["resumo_geral"],
-            "dados": extra,
+        # created_at: omitir para usar default now() do Postgres (evita parsing ISO edge-case).
+        payload: dict = {
+            "tipo_lead": tipo,
+            "nome": nome,
+            "telefone": telefone,
+            "potencial": potencial,
+            "resumo_geral": resumo,
+            "dados": extra or {},
         }
+        opt_keys = (
+            "email",
+            "origem",
+            "imovel_interesse",
+            "perguntas_resumo",
+            "midias_enviadas",
+            "pediu_visita",
+            "urgencia",
+        )
+        for k in opt_keys:
+            if k in row and row[k] is not None:
+                payload[k] = row[k]
+
         client.table("leads").insert(payload).execute()
         return True, None
     except Exception as exc:  # noqa: BLE001 — tool deve devolver texto ao modelo
+        logger.warning("Supabase insert leads falhou: %s", exc, exc_info=True)
+        return False, str(exc)
+
+
+def persist_conversation_turn_supabase(
+    *,
+    canal: str,
+    session_id: str,
+    user_external_id: str | None,
+    user_message: str,
+    assistant_reply: str,
+    metadata: dict | None = None,
+) -> tuple[bool, str | None]:
+    """
+    Grava um turno (mensagem do cliente + resposta da Mari) em public.mari_conversation_turns.
+    Chamado pelo webhook WhatsApp após cada resposta gerada.
+    """
+    if not _supabase_configured():
+        return False, "supabase não configurado"
+    try:
+        from supabase import create_client
+    except ImportError:
+        return False, "pacote supabase não instalado"
+
+    um = (user_message or "").strip()
+    ar = (assistant_reply or "").strip()
+    if not um or not ar:
+        return False, "mensagem ou resposta vazia"
+
+    try:
+        client = create_client(
+            os.environ["SUPABASE_URL"].strip(),
+            os.environ["SUPABASE_SERVICE_ROLE_KEY"].strip(),
+        )
+        client.table("mari_conversation_turns").insert(
+            {
+                "canal": (canal or "whatsapp").strip() or "whatsapp",
+                "session_id": (session_id or "").strip()[:2048],
+                "user_external_id": (user_external_id or "").strip()[:256] or None,
+                "user_message": um[:32000],
+                "assistant_reply": ar[:32000],
+                "metadata": metadata or {},
+            }
+        ).execute()
+        return True, None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Supabase insert mari_conversation_turns falhou: %s", exc, exc_info=True)
         return False, str(exc)
 
 
@@ -101,19 +195,34 @@ def registrar_lead_rascunho(
     except json.JSONDecodeError:
         extra = {"_parse_error": "dados_json inválido"}
 
+    ctx = get_lead_context()
+    if ctx:
+        extra.setdefault("canal", ctx.get("canal"))
+        if ctx.get("telefone_whatsapp"):
+            extra.setdefault("telefone_whatsapp", ctx["telefone_whatsapp"])
+
+    tipo_raw = (tipo_lead or "").strip()
+    tipo_for_storage = _normalize_tipo_lead(tipo_raw) or "cliente_final"
+    if _normalize_tipo_lead(tipo_raw) is None and tipo_raw:
+        extra.setdefault("_tipo_lead_original_invalido", tipo_raw)
+
     potencial = calcular_potencial_sdr(
-        tipo_lead=tipo_lead,
-        dados_completos=_infer_completeness(extra, tipo_lead),
+        tipo_lead=tipo_for_storage,
+        dados_completos=_infer_completeness(extra, tipo_for_storage),
         pediu_visita=bool(pediu_visita),
         urgencia=bool(urgencia),
         midias=bool(midias_enviadas),
     )
 
+    tel = (telefone or "").strip()
+    if not tel and ctx and ctx.get("telefone_whatsapp"):
+        tel = str(ctx["telefone_whatsapp"]).strip()
+
     row = {
         "ts": datetime.now(UTC).isoformat(),
-        "tipo_lead": tipo_lead,
+        "tipo_lead": tipo_for_storage,
         "nome": nome,
-        "telefone": telefone,
+        "telefone": tel or telefone,
         "email": email,
         "origem": origem,
         "imovel_interesse": imovel_interesse,
@@ -141,6 +250,7 @@ def registrar_lead_rascunho(
         else:
             out["supabase"] = "falhou"
             out["supabase_erro"] = err
+            logger.warning("registrar_lead_rascunho: Supabase falhou — %s", err)
 
     return json.dumps(out, ensure_ascii=False)
 

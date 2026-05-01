@@ -15,6 +15,7 @@ from agno.os import AgentOS
 from agno.os.settings import AgnoAPISettings
 
 from tools_maria import calcular_potencial_sdr, obter_fatos_do_anuncio, registrar_lead_rascunho
+from maria_admin_api import maybe_add_cors, register_maria_admin_routes
 from uazapi_webhook import handle_uazapi_whatsapp_event
 
 load_dotenv()
@@ -130,6 +131,8 @@ agent_os = AgentOS(
     settings=AgnoAPISettings(docs_enabled=True),
 )
 app = agent_os.get_app()
+maybe_add_cors(app)
+register_maria_admin_routes(app, maria)
 
 
 @app.get("/swagger", include_in_schema=False)

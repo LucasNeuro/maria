@@ -12,6 +12,9 @@ from fastapi import Request
 
 from agno.agent import Agent
 
+from maria_context import lead_request_context
+from tools_maria import persist_conversation_turn_supabase
+
 logger = logging.getLogger(__name__)
 
 UAZAPI_BASE_URL = os.getenv("UAZAPI_BASE_URL", "").strip().rstrip("/")
@@ -159,15 +162,27 @@ async def handle_uazapi_whatsapp_event(
         logger.warning("Webhook recebido mas UAZAPI não configurado para envio.")
 
     session_id = f"wa:{number}"
-    run_out = await agent.arun(
-        input=user_text,
-        session_id=session_id,
-        user_id=number,
-        stream=False,
-    )
+    async with lead_request_context(canal="whatsapp", telefone_whatsapp=number):
+        run_out = await agent.arun(
+            input=user_text,
+            session_id=session_id,
+            user_id=number,
+            stream=False,
+        )
     reply = (getattr(run_out, "content", None) or "").strip()
     if not reply:
         return 200, {"ok": True, "detail": "empty_agent_reply"}
+
+    ok_turn, err_turn = persist_conversation_turn_supabase(
+        canal="whatsapp",
+        session_id=session_id,
+        user_external_id=number,
+        user_message=user_text,
+        assistant_reply=reply,
+        metadata={"webhook": "uazapi"},
+    )
+    if not ok_turn:
+        logger.warning("Gravar turno em mari_conversation_turns falhou: %s", err_turn)
 
     try:
         await _uazapi_send_text(number, reply)

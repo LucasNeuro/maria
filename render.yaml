@@ -18,6 +18,12 @@ services:
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
+      # Painel React: GET /api/maria/leads (não uses a service role no browser).
+      - key: MARIA_ADMIN_API_KEY
+        sync: false
+      # Opcional: origens CORS separadas por vírgula, ex. https://app.teudominio.com
+      - key: MARIA_CORS_ORIGINS
+        sync: false
       # WhatsApp (UAZAPI): base do servidor + token da instância (não o admin token).
       - key: UAZAPI_BASE_URL
         sync: false

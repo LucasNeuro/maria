@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY maria_os.py tools_maria.py uazapi_webhook.py run.py pyproject.toml ./
+COPY maria_os.py tools_maria.py uazapi_webhook.py maria_context.py maria_admin_api.py run.py pyproject.toml ./
 COPY specs ./specs
 
 ENV PYTHONUNBUFFERED=1

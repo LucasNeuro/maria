@@ -1,4 +1,9 @@
-"""Transcrição de voz (STT) via API Mistral — uso com áudio WhatsApp descarregado pela UAZAPI."""
+"""Transcrição de voz (STT) via API Mistral — uso com áudio WhatsApp descarregado pela UAZAPI.
+
+Implementação com ``httpx`` (multipart ``POST /v1/audio/transcriptions``) para não depender da versão
+exposta pelo pacote ``mistralai`` no ``import`` — evita ``ImportError`` em deploy quando o SDK não
+exporta ``Mistral`` como esperado.
+"""
 
 from __future__ import annotations
 
@@ -6,8 +11,6 @@ import logging
 import os
 
 import httpx
-from mistralai import Mistral
-from mistralai.models import File
 
 from uazapi_client import download_message_media_sync, uazapi_configured
 
@@ -50,6 +53,13 @@ def _filename_from_mime(mime: str) -> str:
     return "voice.bin"
 
 
+def _mistral_audio_transcriptions_url() -> str:
+    base = (os.getenv("MISTRAL_API_BASE_URL") or "https://api.mistral.ai").strip().rstrip("/")
+    if base.endswith("/v1"):
+        return f"{base}/audio/transcriptions"
+    return f"{base}/v1/audio/transcriptions"
+
+
 def transcribe_audio_bytes_sync(
     body: bytes,
     *,
@@ -57,7 +67,7 @@ def transcribe_audio_bytes_sync(
     content_type: str | None = None,
 ) -> str | None:
     """
-    ``POST /v1/audio/transcriptions`` (SDK Mistral).
+    ``POST /v1/audio/transcriptions`` (API Mistral, multipart via httpx).
     Modelo por defeito: ``voxtral-mini-latest`` (``MARIA_STT_MODEL``).
     """
     key = (os.getenv("MISTRAL_API_KEY") or "").strip()
@@ -65,27 +75,38 @@ def transcribe_audio_bytes_sync(
         return None
     fn = (filename or "voice.bin").strip()[-200:] or "voice.bin"
     ct = (content_type or "application/octet-stream").split(";")[0].strip() or "application/octet-stream"
-    client = Mistral(api_key=key)
-    kwargs: dict = {
-        "model": _stt_model(),
-        "file": File(file_name=fn, content=body, content_type=ct),
-    }
+    url = _mistral_audio_transcriptions_url()
+    headers = {"Authorization": f"Bearer {key}"}
+    files = {"file": (fn, body, ct)}
+    form: list[tuple[str, str]] = [("model", _stt_model())]
     lang = (os.getenv("MARIA_STT_LANGUAGE") or "pt").strip()
     if lang:
-        kwargs["language"] = lang
+        form.append(("language", lang))
     if os.getenv("MARIA_STT_TIMESTAMP_SEGMENTS", "1").strip().lower() not in ("0", "false", "no", "off"):
-        kwargs["timestamp_granularities"] = ["segment"]
+        form.append(("timestamp_granularities", "segment"))
     try:
-        resp = client.audio.transcriptions.complete(**kwargs)
+        with httpx.Client(timeout=120.0) as client:
+            r = client.post(url, headers=headers, data=form, files=files)
     except Exception as exc:
-        logger.warning("mistral STT complete failed: %s", exc, exc_info=True)
+        logger.warning("mistral STT request failed: %s", exc, exc_info=True)
         return None
-    text = getattr(resp, "text", None)
-    if text is None and hasattr(resp, "model_dump"):
-        d = resp.model_dump()
-        text = d.get("text") if isinstance(d, dict) else None
+
+    if r.status_code >= 400:
+        logger.warning("mistral STT HTTP %s | %s", r.status_code, _clip_response_text(r.text))
+        return None
+    try:
+        payload = r.json()
+    except Exception as exc:
+        logger.warning("mistral STT JSON parse failed: %s", exc)
+        return None
+    text = payload.get("text") if isinstance(payload, dict) else None
     out = str(text or "").strip()
     return out if out else None
+
+
+def _clip_response_text(t: str, n: int = 400) -> str:
+    s = (t or "").strip().replace("\n", " ")
+    return s if len(s) <= n else s[: n - 3] + "..."
 
 
 def transcribe_voice_uazapi_sync(message_id: str) -> str | None:

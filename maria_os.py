@@ -110,7 +110,7 @@ Nunca ignores o nome. Sempre que informarem o nome (ou corrigirem), **reconhece*
 
 ## Exceções rápidas (secção 14)
 - Nome corrigido → atualiza e reconhece.
-- Áudio → o **webhook** responde já com aviso curto de que **ainda não há transcrição** e pede texto; no POP continua a considerar o áudio no registo quando o cliente depois escrever.
+- Áudio → o **webhook** tenta **transcrever** a voz (Mistral `voxtral-mini-latest` por defeito) e trata como **texto** no mesmo fluxo do agente; se falhar ou STT desligado, envia aviso a pedir texto escrito.
 - Imagem → **alinhado ao AgentOS:** com `MARIA_MULTIMODAL_VISION=1` e modelo com **visão**, o webhook passa `images=` ao `arun` como no Studio; descreve o que importa para o imóvel/atendimento **sem inventar** endereço ou preço até o cliente ou ViaCEP confirmarem.
 - Localização → quando o cliente partilhar pin, usa lat/lon e nome do local no raciocínio; não pedir coordenadas manuais se já vieram.
 - Fora do escopo → resposta breve + encaminhar humano.

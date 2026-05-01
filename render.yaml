@@ -11,7 +11,7 @@ services:
     healthCheckPath: /health
     envVars:
       - key: MARIA_MODEL
-        value: "mistral:mistral-small-latest"
+        value: "mistral:pixtral-large-latest"
       - key: MISTRAL_API_KEY
         sync: false
       - key: SUPABASE_URL

@@ -16,6 +16,7 @@ from agno.agent import Agent
 from agno.media import File, Image
 
 from maria_context import lead_request_context
+from maria_stt import mistral_stt_enabled_env, transcribe_voice_uazapi_sync
 from tools_maria import persist_conversation_turn_supabase, persist_uazapi_downloaded_images_sync
 from uazapi_client import (
     build_send_menu_body,
@@ -490,6 +491,7 @@ class InboundTurn:
     location: dict[str, Any] | None
     source_msg: dict[str, Any]
     audio_only: bool = False
+    from_voice_transcription: bool = False
     vision_images: list[Image] = field(default_factory=list)
     file_inputs: list[File] = field(default_factory=list)
     video_attachment_note: bool = False
@@ -538,6 +540,7 @@ def _pick_inbound_turn(body: Any) -> InboundTurn | None:
             location=loc,
             source_msg=dict(msg),
             audio_only=bool(audio_pure),
+            from_voice_transcription=False,
         )
         if best is None or ts >= best[0]:
             best = (ts, cand)
@@ -744,60 +747,84 @@ async def handle_uazapi_whatsapp_event(
     )
 
     if inbound.audio_only:
-        reply = MARIA_AUDIO_UNSUPPORTED_REPLY_PT
-        user_text = (
-            "[Cliente enviou mensagem de voz/áudio — canal ainda sem transcrição automática. "
-            "Aviso enviado conforme POP.]"
-        )
-        logger.info("[uazapi] audio_only | session=%s", session_id)
-        async with lead_request_context(canal="whatsapp", telefone_whatsapp=number):
-            pass
-        chat_details: dict[str, Any] | None = None
-        if uazapi_configured():
-            try:
-                chat_details = await asyncio.to_thread(fetch_chat_details_sync, number)
-            except Exception as e:
-                logger.warning("[uazapi] chat/details | digits=%s | err=%s", number, e)
-        tag_name: str | None = None
-        if isinstance(chat_details, dict):
-            raw_tag = (
-                chat_details.get("wa_name")
-                or chat_details.get("name")
-                or chat_details.get("lead_name")
-                or chat_details.get("wa_contactName")
+        transcribed: str | None = None
+        if mistral_stt_enabled_env():
+            mid_stt = _wa_message_id(inbound.source_msg)
+            if mid_stt:
+                try:
+                    transcribed = await asyncio.to_thread(transcribe_voice_uazapi_sync, mid_stt)
+                except Exception as e:
+                    logger.warning("[uazapi] stt | session=%s | err=%s", session_id, e)
+            else:
+                logger.warning("[uazapi] stt skipped | session=%s | sem messageid", session_id)
+        if transcribed:
+            prefix = (os.getenv("MARIA_STT_CONTEXT_PREFIX") or "").strip()
+            if prefix:
+                inbound.text_raw = f"{prefix}\n{transcribed}".strip()
+            else:
+                inbound.text_raw = transcribed
+            inbound.audio_only = False
+            inbound.from_voice_transcription = True
+            logger.info(
+                "[uazapi] stt_ok | session=%s | len=%d | preview=%r",
+                session_id,
+                len(transcribed),
+                _clip(transcribed, 100),
             )
-            if raw_tag:
-                tag_name = str(raw_tag).strip()[:200]
-        hook_payload: dict | list = body if isinstance(body, (dict, list)) else {"_repr": str(body)[:12000]}
-        user_payload_audio: dict[str, Any] = {
-            "text": user_text,
-            "source": "whatsapp_inbound",
-            "audio_received": True,
-        }
-        ok_turn, err_turn = persist_conversation_turn_supabase(
-            canal="whatsapp",
-            session_id=session_id,
-            phone_e164=number,
-            tag_name=tag_name,
-            user_payload=user_payload_audio,
-            assistant_payload={"text": reply, "source": "mari_agent"},
-            webhook_payload=hook_payload,
-            uazapi_chat_details=chat_details,
-            metadata={"webhook": "uazapi", "audio_only": True},
-        )
-        if ok_turn:
-            logger.info("[uazapi] persist_turn | session=%s | ok=true", session_id)
         else:
-            logger.warning("[uazapi] persist_turn | session=%s | ok=false | err=%s", session_id, err_turn)
-        try:
-            await _uazapi_send_text(number, reply)
-        except httpx.HTTPStatusError as e:
-            logger.exception("UAZAPI send/text falhou: %s", e.response.text[:500])
-            return 502, {"ok": False, "error": "uazapi_send_failed"}
-        except httpx.RequestError as e:
-            logger.exception("UAZAPI rede: %s", e)
-            return 502, {"ok": False, "error": "uazapi_network_error"}
-        return 200, {"ok": True, "detail": "audio_unsupported_notice_sent"}
+            reply = MARIA_AUDIO_UNSUPPORTED_REPLY_PT
+            user_text = (
+                "[Cliente enviou mensagem de voz/áudio — transcrição indisponível ou falhou; aviso enviado.]"
+            )
+            logger.info("[uazapi] audio_only | session=%s | stt=off_ou_falhou", session_id)
+            async with lead_request_context(canal="whatsapp", telefone_whatsapp=number):
+                pass
+            chat_details: dict[str, Any] | None = None
+            if uazapi_configured():
+                try:
+                    chat_details = await asyncio.to_thread(fetch_chat_details_sync, number)
+                except Exception as e:
+                    logger.warning("[uazapi] chat/details | digits=%s | err=%s", number, e)
+            tag_name: str | None = None
+            if isinstance(chat_details, dict):
+                raw_tag = (
+                    chat_details.get("wa_name")
+                    or chat_details.get("name")
+                    or chat_details.get("lead_name")
+                    or chat_details.get("wa_contactName")
+                )
+                if raw_tag:
+                    tag_name = str(raw_tag).strip()[:200]
+            hook_payload = body if isinstance(body, (dict, list)) else {"_repr": str(body)[:12000]}
+            user_payload_audio: dict[str, Any] = {
+                "text": user_text,
+                "source": "whatsapp_inbound",
+                "audio_received": True,
+            }
+            ok_turn, err_turn = persist_conversation_turn_supabase(
+                canal="whatsapp",
+                session_id=session_id,
+                phone_e164=number,
+                tag_name=tag_name,
+                user_payload=user_payload_audio,
+                assistant_payload={"text": reply, "source": "mari_agent"},
+                webhook_payload=hook_payload,
+                uazapi_chat_details=chat_details,
+                metadata={"webhook": "uazapi", "audio_only": True},
+            )
+            if ok_turn:
+                logger.info("[uazapi] persist_turn | session=%s | ok=true", session_id)
+            else:
+                logger.warning("[uazapi] persist_turn | session=%s | ok=false | err=%s", session_id, err_turn)
+            try:
+                await _uazapi_send_text(number, reply)
+            except httpx.HTTPStatusError as e:
+                logger.exception("UAZAPI send/text falhou: %s", e.response.text[:500])
+                return 502, {"ok": False, "error": "uazapi_send_failed"}
+            except httpx.RequestError as e:
+                logger.exception("UAZAPI rede: %s", e)
+                return 502, {"ok": False, "error": "uazapi_network_error"}
+            return 200, {"ok": True, "detail": "audio_unsupported_notice_sent"}
 
     await asyncio.to_thread(_enrich_inbound_with_uazapi_download, inbound)
     logger.info(
@@ -940,6 +967,8 @@ async def handle_uazapi_whatsapp_event(
     hook_payload = body if isinstance(body, (dict, list)) else {"_repr": str(body)[:12000]}
 
     user_payload: dict[str, Any] = {"text": user_text, "source": "whatsapp_inbound"}
+    if inbound.from_voice_transcription:
+        user_payload["voice_transcription"] = True
     if inbound.image_urls:
         user_payload["images"] = inbound.image_urls
     if inbound.location:

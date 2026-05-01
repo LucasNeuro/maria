@@ -49,7 +49,7 @@ Documento vivo para orientar desenvolvimento. **Fonte de verdade operacional:** 
 Definir em `.env` (ou no shell):
 
 - `MISTRAL_API_KEY` — obrigatório para chamar a API Mistral.
-- `MARIA_MODEL` — opcional; padrão `mistral:mistral-small-latest` (formato Agno: `mistral:<model_id>`).
+- `MARIA_MODEL` — recomendado `mistral:pixtral-large-latest` (ou outro Mistral com visão) para WhatsApp com imagens; só texto: `mistral:mistral-small-latest`.
 
 Futuro:
 

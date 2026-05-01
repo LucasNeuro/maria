@@ -8,8 +8,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY maria_os.py tools_maria.py uazapi_webhook.py uazapi_client.py maria_context.py maria_admin_api.py maria_logging.py docker_entry.py run.py pyproject.toml ./
+COPY maria_os.py maria_skills_loader.py tools_maria.py uazapi_webhook.py uazapi_client.py maria_context.py maria_admin_api.py maria_logging.py docker_entry.py run.py pyproject.toml ./
 COPY specs ./specs
+COPY skills ./skills
 
 ENV PYTHONUNBUFFERED=1
 # Render (e outros PaaS) injetam PORT; localmente usa 8000

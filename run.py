@@ -2,7 +2,10 @@
 
 import uvicorn
 
+from maria_logging import UVICORN_RICH_LOG_CONFIG, quiet_noisy_loggers
+
 if __name__ == "__main__":
+    quiet_noisy_loggers()
     print(
         "\n  Mari AgentOS\n"
         "  - Swagger UI:  http://127.0.0.1:8000/docs\n"
@@ -15,4 +18,6 @@ if __name__ == "__main__":
         host="127.0.0.1",
         port=8000,
         reload=True,
+        log_config=UVICORN_RICH_LOG_CONFIG,
+        access_log=True,
     )

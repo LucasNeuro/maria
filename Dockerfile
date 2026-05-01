@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY maria_os.py tools_maria.py uazapi_webhook.py maria_context.py maria_admin_api.py run.py pyproject.toml ./
+COPY maria_os.py tools_maria.py uazapi_webhook.py maria_context.py maria_admin_api.py maria_logging.py docker_entry.py run.py pyproject.toml ./
 COPY specs ./specs
 
 ENV PYTHONUNBUFFERED=1
@@ -16,4 +16,5 @@ ENV PYTHONUNBUFFERED=1
 ENV PORT=8000
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn maria_os:app --host 0.0.0.0 --port ${PORT}"]
+ENV FORCE_COLOR=1
+CMD ["sh", "-c", "python docker_entry.py"]

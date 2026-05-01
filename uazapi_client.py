@@ -43,6 +43,40 @@ def uazapi_post_json(path: str, body: dict[str, Any], *, timeout: float = 60.0) 
         return data
 
 
+def send_location_button_sync(
+    number: str,
+    text: str,
+    *,
+    delay: int | None = None,
+    readchat: bool | None = None,
+    readmessages: bool | None = None,
+    replyid: str | None = None,
+    track_source: str | None = None,
+    track_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    ``POST /send/location-button`` — mensagem com botão nativo para o utilizador partilhar localização.
+    Campos extra seguem a spec UAZAPI (opcionais).
+    """
+    num = (number or "").strip()
+    body: dict[str, Any] = {"number": num, "text": (text or "").strip()}
+    if not num or not body["text"]:
+        raise ValueError("number e text são obrigatórios")
+    if delay is not None:
+        body["delay"] = int(delay)
+    if readchat is not None:
+        body["readchat"] = bool(readchat)
+    if readmessages is not None:
+        body["readmessages"] = bool(readmessages)
+    if replyid:
+        body["replyid"] = replyid.strip()
+    if track_source:
+        body["track_source"] = track_source.strip()
+    if track_id:
+        body["track_id"] = track_id.strip()
+    return uazapi_post_json("send/location-button", body, timeout=60.0)
+
+
 def fetch_chat_details_sync(number: str, *, preview_image: bool = False) -> dict[str, Any]:
     """
     ``POST /chat/details`` — detalhes completos do modelo Chat (spec UAZAPI).

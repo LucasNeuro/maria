@@ -27,6 +27,17 @@ Faz **nesta ordem**:
 
 5. **Depois de ligado**, no painel abre o **chat / agentes** do OS que criaste e escolhe o agente **Mari** para mandar mensagens de teste (ex.: “Olá, quero comprar um apartamento”).
 
+### “AgentOS not active” / “Failed to connect to the AgentOS” no Studio
+
+Isto aparece quando o **painel** não consegue falar com o processo local (ou quando o OS ainda não respondeu como “ativo”).
+
+1. **Garante que `python run.py` está a correr** no mesmo PC e na mesma porta (`8000` por defeito).
+2. No modal de ligação, **ENDPOINT URL** deve ser exatamente o que o Uvicorn mostra, p.ex. `http://127.0.0.1:8000` ou `http://localhost:8000`.
+3. Clica **REFRESH** no Studio (ou desliga/volta a ligar o OS).
+4. Se o Studio estiver noutra rede/máquina, `localhost` **não** chega — usa deploy público ou túnel (ngrok, etc.) e regista essa URL como endpoint **Live**.
+
+O webhook **WhatsApp** (`POST /webhooks/uazapi`) é **outra rota** na mesma app: enquanto o servidor estiver no ar, UAZAPI continua a funcionar; testar pelo Studio ou pelo `/docs` não desliga o WhatsApp.
+
 **Para validar só a API (sem painel):** com o servidor a correr, abre [http://localhost:8000/docs](http://localhost:8000/docs) → `POST /agents/mari/runs` → **Try it out** → `message` = texto de teste → **Execute**.
 
 ---
@@ -103,6 +114,30 @@ Documentação: [Agno Infra overview](https://docs.agno.com/deploy/infra/overvie
 | 401 nas chamadas | `OS_SECURITY_KEY` — Bearer correto ou remove a variável. |
 | Painel cloud não alcança `localhost` | Usar URL pública (deploy ou túnel). |
 | Agente não aparece no chat | ID do agente é **`mari`** — OS tem de expor esse Agent na lista `/config`. |
+
+---
+
+---
+
+## Memória (painel direito no Studio)
+
+O separador **Memory** só mostra entradas quando:
+
+1. O código tem **`enable_user_memories=True`** e partilha **`memory_manager` + `db`** com a Mari (já assim no `maria_os.py`).
+2. O turno **terminou** (a extração corre no fim do run; pode demorar mais um pouco que o texto da resposta).
+3. O **`user_id`** no chat é o mesmo que estás a filtrar no painel (no Studio costuma ser o email da conta Agno; no WhatsApp é o número).
+
+**Mensagens só com “Olá”:** antes o modelo podia não criar memória nenhuma; há instruções no `MemoryManager` para gravar pelo menos uma entrada de cumprimento/primeiro contacto.
+
+**Confirmar na tua máquina:**
+
+```powershell
+python scripts/list_user_memories.py "teu-email@dominio.com"
+```
+
+Sem aspas se não houver espaços. Envia depois uma mensagem com **nome ou intenção** (“Sou o Lucas e quero alugar…”) e volta a correr o comando.
+
+**Backend:** sem `DATABASE_URL` as memórias ficam em `agno.db` ao lado do projeto; com Postgres (Supabase), na tabela configurada pelo Agno (por defeito relacionada com memórias).
 
 ---
 

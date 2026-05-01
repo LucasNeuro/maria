@@ -1,4 +1,4 @@
-"""Pont WhatsApp UAZAPI ↔ Mari: recebe webhook POST e responde com `/send/text`."""
+"""Pont WhatsApp UAZAPI ↔ Mari: recebe webhook POST e responde com `/send/text` (+ multimodal → Agno)."""
 
 from __future__ import annotations
 
@@ -6,12 +6,14 @@ import asyncio
 import json
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 from fastapi import Request
 
 from agno.agent import Agent
+from agno.media import Image
 
 from maria_context import lead_request_context
 from tools_maria import persist_conversation_turn_supabase
@@ -90,18 +92,41 @@ def _digits(local_part: str) -> str:
     return "".join(c for c in local_part if c.isdigit())
 
 
+def _content_as_dict(content: Any) -> dict[str, Any] | None:
+    if content is None:
+        return None
+    if isinstance(content, dict):
+        return content
+    if isinstance(content, str):
+        s = content.strip()
+        if s.startswith("{") or s.startswith("["):
+            try:
+                parsed = json.loads(s)
+            except (json.JSONDecodeError, TypeError):
+                return None
+            return parsed if isinstance(parsed, dict) else None
+    return None
+
+
 def _parse_content_text(content: Any) -> str:
     if content is None:
         return ""
-    if isinstance(content, dict):
-        if isinstance(content.get("extendedTextMessage"), dict):
-            t = content["extendedTextMessage"].get("text")
+    c = _content_as_dict(content)
+    if c:
+        if isinstance(c.get("extendedTextMessage"), dict):
+            t = c["extendedTextMessage"].get("text")
             if isinstance(t, str) and t.strip():
                 return t.strip()
         for key in ("conversation", "text", "caption"):
-            v = content.get(key)
+            v = c.get(key)
             if isinstance(v, str) and v.strip():
                 return v.strip()
+        for media_key in ("imageMessage", "videoMessage", "documentMessage"):
+            sub = c.get(media_key)
+            if isinstance(sub, dict):
+                cap = sub.get("caption")
+                if isinstance(cap, str) and cap.strip():
+                    return cap.strip()
         return ""
     if isinstance(content, str):
         s = content.strip()
@@ -112,6 +137,143 @@ def _parse_content_text(content: Any) -> str:
                 pass
         return s
     return ""
+
+
+def _parse_location_from_content(content: Any) -> dict[str, Any] | None:
+    c = _content_as_dict(content)
+    if not c:
+        return None
+    lm = c.get("locationMessage")
+    if not isinstance(lm, dict):
+        return None
+    lat, lng = lm.get("degreesLatitude"), lm.get("degreesLongitude")
+    if lat is None and lng is None:
+        return None
+    try:
+        flat = float(lat) if lat is not None else None
+        flng = float(lng) if lng is not None else None
+    except (TypeError, ValueError):
+        return None
+    name = lm.get("name") or lm.get("title") or ""
+    addr = lm.get("address") or ""
+    return {
+        "latitude": flat,
+        "longitude": flng,
+        "name": str(name).strip() if name is not None else "",
+        "address": str(addr).strip() if addr is not None else "",
+    }
+
+
+def _http_urls_from_message(msg: dict[str, Any]) -> list[str]:
+    """URLs públicas (imagem/vídeo) para passar ao Agno ``Image(url=...)``."""
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def add(u: Any) -> None:
+        if not isinstance(u, str):
+            return
+        s = u.strip()
+        if not s.startswith(("http://", "https://")):
+            return
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+
+    add(msg.get("fileURL"))
+    c = _content_as_dict(msg.get("content"))
+    if c:
+        sub = c.get("imageMessage")
+        if isinstance(sub, dict):
+            add(sub.get("url"))
+    return out
+
+
+def _message_timestamp_ms(msg: dict[str, Any]) -> int:
+    ts = msg.get("messageTimestamp")
+    if isinstance(ts, (int, float)):
+        return int(ts)
+    if isinstance(ts, str) and ts.isdigit():
+        return int(ts)
+    return 0
+
+
+def _multimodal_vision_enabled() -> bool:
+    return os.getenv("MARIA_MULTIMODAL_VISION", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _max_inbound_images() -> int:
+    try:
+        n = int((os.getenv("MARIA_MULTIMODAL_MAX_IMAGES") or "4").strip())
+    except ValueError:
+        n = 4
+    return max(1, min(n, 8))
+
+
+def _build_agent_user_text(text_raw: str, location: dict[str, Any] | None, n_images: int) -> str:
+    parts: list[str] = []
+    t = (text_raw or "").strip()
+    if t:
+        parts.append(t)
+    if location:
+        lat = location.get("latitude")
+        lng = location.get("longitude")
+        nm = str(location.get("name") or "").strip()
+        addr = str(location.get("address") or "").strip()
+        geo = f"[Localização partilhada pelo cliente: latitude={lat} longitude={lng}"
+        if nm:
+            geo += f" nome_do_local={nm!r}"
+        if addr:
+            geo += f" endereco={addr!r}"
+        parts.append(geo + "]")
+    if n_images:
+        if not t and not location:
+            parts.append(
+                "O cliente enviou uma imagem pelo WhatsApp (sem texto). "
+                "Analisa a imagem no contexto imobiliário e responde em português do Brasil, de forma curta."
+            )
+        elif t:
+            parts.append(
+                "(O cliente também enviou imagem(ns) em anexo — considera o conteúdo visual quando for relevante.)"
+            )
+    return "\n\n".join(parts).strip()
+
+
+@dataclass
+class InboundTurn:
+    number: str
+    text_raw: str
+    image_urls: list[str]
+    location: dict[str, Any] | None
+    source_msg: dict[str, Any]
+
+
+def _pick_inbound_turn(body: Any) -> InboundTurn | None:
+    """Última mensagem elegível por ``messageTimestamp`` (texto, imagem URL e/ou localização)."""
+    best: tuple[int, InboundTurn] | None = None
+    for msg in _collect_dicts(body):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("wasSentByApi") or msg.get("fromMe"):
+            continue
+        dest = _destination_number_or_jid(msg)
+        if not dest:
+            continue
+        text_raw = _message_text(msg)
+        loc = _parse_location_from_content(msg.get("content"))
+        urls = _http_urls_from_message(msg)
+        if not (text_raw.strip() or urls or loc):
+            continue
+        ts = _message_timestamp_ms(msg)
+        cand = InboundTurn(
+            number=dest,
+            text_raw=text_raw,
+            image_urls=urls,
+            location=loc,
+            source_msg=msg,
+        )
+        if best is None or ts >= best[0]:
+            best = (ts, cand)
+    return best[1] if best else None
 
 
 def _message_text(msg: dict[str, Any]) -> str:
@@ -142,28 +304,6 @@ def _destination_number_or_jid(msg: dict[str, Any]) -> str | None:
     local = raw.split("@", 1)[0]
     digits = _digits(local)
     return digits or None
-
-
-def _pick_incoming_message(body: Any) -> tuple[str | None, str | None]:
-    """Última mensagem de texto elegível (evita eco API / fromMe / opcional grupos)."""
-    candidates = _collect_dicts(body)
-    last_num: str | None = None
-    last_text: str | None = None
-    for msg in candidates:
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("wasSentByApi"):
-            continue
-        if msg.get("fromMe"):
-            continue
-        text = _message_text(msg)
-        if not text:
-            continue
-        dest = _destination_number_or_jid(msg)
-        if not dest:
-            continue
-        last_num, last_text = dest, text
-    return last_num, last_text
 
 
 def _verify_webhook_secret(request: Request) -> bool:
@@ -208,28 +348,51 @@ async def handle_uazapi_whatsapp_event(
 
     logger.info("[uazapi] webhook | client=%s | %s", peer, _body_summary(body))
 
-    number, user_text = _pick_incoming_message(body)
-    if not number or not user_text:
+    inbound = _pick_inbound_turn(body)
+    if not inbound:
         stats = _scan_incoming_stats(body)
         logger.info(
-            "[uazapi] no_actionable_text | client=%s | stats=%s | body=%s",
+            "[uazapi] no_actionable_inbound | client=%s | stats=%s | body=%s",
             peer,
             stats,
             _body_summary(body),
         )
-        return 200, {"ok": True, "detail": "no_actionable_text_message"}
+        return 200, {"ok": True, "detail": "no_actionable_inbound_message"}
+
+    number = inbound.number
+    vision_on = _multimodal_vision_enabled()
+    cap_n = _max_inbound_images()
+    image_urls_model = inbound.image_urls[:cap_n] if vision_on else []
+    if inbound.image_urls and not vision_on:
+        logger.info(
+            "[uazapi] multimodal_images_skipped | MARIA_MULTIMODAL_VISION=0 | n_urls=%d",
+            len(inbound.image_urls),
+        )
+
+    user_text = _build_agent_user_text(inbound.text_raw, inbound.location, len(inbound.image_urls))
+    if inbound.image_urls and not vision_on:
+        user_text += (
+            "\n\n[Nota: há imagem(ns) no WhatsApp; com MARIA_MULTIMODAL_VISION=0 o modelo não a vê — "
+            "pede uma descrição breve por texto ou confirma que vais tratar sem detalhe visual.]"
+        )
 
     if not UAZAPI_BASE_URL or not UAZAPI_INSTANCE_TOKEN:
         logger.warning("Webhook recebido mas UAZAPI não configurado para envio.")
 
     session_id = f"wa:{number}"
     logger.info(
-        "[uazapi] inbound | session=%s | digits=%s | in_len=%d | in_preview=%r",
+        "[uazapi] inbound | session=%s | digits=%s | in_len=%d | images=%d | location=%s | in_preview=%r",
         session_id,
         number,
         len(user_text),
+        len(inbound.image_urls),
+        bool(inbound.location),
         _clip(user_text, 200),
     )
+
+    images_kw: list[Image] | None = None
+    if image_urls_model:
+        images_kw = [Image(url=u) for u in image_urls_model]
 
     async with lead_request_context(canal="whatsapp", telefone_whatsapp=number):
         run_out = await agent.arun(
@@ -237,6 +400,7 @@ async def handle_uazapi_whatsapp_event(
             session_id=session_id,
             user_id=number,
             stream=False,
+            images=images_kw,
         )
     reply = (getattr(run_out, "content", None) or "").strip()
     if not reply:
@@ -270,12 +434,18 @@ async def handle_uazapi_whatsapp_event(
 
     hook_payload: dict | list = body if isinstance(body, (dict, list)) else {"_repr": str(body)[:12000]}
 
+    user_payload: dict[str, Any] = {"text": user_text, "source": "whatsapp_inbound"}
+    if inbound.image_urls:
+        user_payload["images"] = inbound.image_urls
+    if inbound.location:
+        user_payload["location"] = inbound.location
+
     ok_turn, err_turn = persist_conversation_turn_supabase(
         canal="whatsapp",
         session_id=session_id,
         phone_e164=number,
         tag_name=tag_name,
-        user_payload={"text": user_text, "source": "whatsapp_inbound"},
+        user_payload=user_payload,
         assistant_payload={"text": reply, "source": "mari_agent"},
         webhook_payload=hook_payload,
         uazapi_chat_details=chat_details,

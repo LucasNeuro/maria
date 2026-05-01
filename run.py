@@ -11,6 +11,9 @@ if __name__ == "__main__":
         "  - Swagger UI:  http://127.0.0.1:8000/docs\n"
         "  - Atalho:      http://127.0.0.1:8000/swagger\n"
         "  - Chat API:    POST /agents/mari/runs (multipart: message=...)\n"
+        "  - WhatsApp:    POST /webhooks/uazapi (inalterado enquanto este processo corre)\n"
+        "  Agno Studio (os.agno.com): liga OS em Local → http://127.0.0.1:8000 — depois REFRESH no Studio.\n"
+        "  Guia: specs/agno-agentos-connection.md\n"
         "  Se usar OS_SECURITY_KEY no .env, no Swagger clique em Authorize e Bearer <chave>.\n"
     )
     uvicorn.run(

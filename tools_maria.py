@@ -6,6 +6,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -226,6 +227,106 @@ def _same_contact_phone(stored: str, canonical_digits: str) -> bool:
     if len(a) >= 10 and len(b) >= 10 and a[-10:] == b[-10:]:
         return True
     return a.endswith(b) or b.endswith(a)
+
+
+_MEMORY_EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,20}$")
+
+
+def _normalize_agno_memory_email(raw: str) -> str | None:
+    s = (raw or "").strip().lower()
+    if not s or _MEMORY_EMAIL_RE.match(s) is None:
+        return None
+    return s
+
+
+def _extract_email_from_uazapi_chat_details(obj: object, *, _depth: int = 0) -> str | None:
+    if _depth > 8:
+        return None
+    if isinstance(obj, dict):
+        for k in (
+            "lead_email",
+            "leadEmail",
+            "email",
+            "wa_email",
+            "contact_email",
+            "ContactEmail",
+            "e_mail",
+            "mail",
+        ):
+            v = obj.get(k)
+            if v is None:
+                continue
+            ne = _normalize_agno_memory_email(str(v))
+            if ne:
+                return ne
+        for v in obj.values():
+            ne = _extract_email_from_uazapi_chat_details(v, _depth=_depth + 1)
+            if ne:
+                return ne
+    elif isinstance(obj, list):
+        for item in obj[:40]:
+            ne = _extract_email_from_uazapi_chat_details(item, _depth=_depth + 1)
+            if ne:
+                return ne
+    return None
+
+
+def _lead_email_for_phone_from_supabase(phone_digits: str) -> str | None:
+    """Primeiro e-mail não vazio em ``leads`` cujo telefone casa com ``phone_digits``."""
+    if not _supabase_configured():
+        return None
+    phone = _digits_only(phone_digits)
+    if not phone:
+        return None
+    try:
+        from supabase import create_client
+    except ImportError:
+        return None
+    try:
+        client = create_client(
+            os.environ["SUPABASE_URL"].strip(),
+            os.environ["SUPABASE_SERVICE_ROLE_KEY"].strip(),
+        )
+        lead_resp = (
+            client.table("leads")
+            .select("email,telefone,created_at")
+            .order("created_at", desc=True)
+            .limit(400)
+            .execute()
+        )
+        for row in lead_resp.data or []:
+            if not _same_contact_phone(str(row.get("telefone") or ""), phone):
+                continue
+            ne = _normalize_agno_memory_email(str(row.get("email") or ""))
+            if ne:
+                return ne
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("lead_email_for_phone_from_supabase: %s", exc, exc_info=True)
+    return None
+
+
+def resolve_agno_user_id_for_whatsapp(
+    telefone_whatsapp: str,
+    chat_details: dict[str, Any] | None = None,
+) -> str:
+    """
+    ``user_id`` do Agno (MemoryManager) no WhatsApp.
+
+    Por defeito: só dígitos do telefone. Com ``MARIA_WHATSAPP_MEMORY_USER_ID_STRATEGY=email_first``,
+    usa o e-mail vindo do UAZAPI ``/chat/details`` ou do Supabase ``public.leads`` (mesmo contacto),
+    alinhando com o Agno Studio quando o utilizador é identificado pelo mesmo e-mail.
+    """
+    phone = _digits_only(telefone_whatsapp or "")
+    if not phone:
+        return ""
+    strategy = (os.getenv("MARIA_WHATSAPP_MEMORY_USER_ID_STRATEGY") or "phone").strip().lower()
+    if strategy in ("email_first", "email", "studio", "prefer_email"):
+        email = _extract_email_from_uazapi_chat_details(chat_details) if chat_details else None
+        if not email:
+            email = _lead_email_for_phone_from_supabase(phone)
+        if email:
+            return email
+    return phone
 
 
 def _payload_text(payload: object, max_len: int = 4000) -> str:

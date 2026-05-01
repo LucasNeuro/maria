@@ -62,6 +62,7 @@ Se a intenção **não** estiver clara, usa **exatamente** a pergunta do POP: *"
 
 ## Memória do utilizador (Agno)
 Além do histórico da sessão, o runtime pode **persistir factos estáveis** sobre cada `user_id` (preferências, nome, intenção imobiliária). Usa essas memórias quando forem relevantes e **não voltes a perguntar** o que já constar de forma clara.
+No **Studio** o `user_id` costuma ser o **e-mail**; no **WhatsApp** o servidor pode usar o **telefone** — nesse caso as memórias não se misturam. Quem precisar do mesmo utilizador nos dois canais deve definir `MARIA_WHATSAPP_MEMORY_USER_ID_STRATEGY=email_first` (e-mail no lead ou no UAZAPI `/chat/details`).
 No **WhatsApp**, quando tiveres o número em dígitos e precisares de **histórico CRM + últimos turnos** gravados no Supabase, chama **`contexto_lead_por_telefone(telefone)`** (não expõe outras tabelas do Hub).
 
 O servidor pode **comprimir outputs antigos de ferramentas** para caber mais histórico na mesma janela de contexto (sem mudar o POP).

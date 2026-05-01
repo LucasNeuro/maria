@@ -17,7 +17,11 @@ from agno.media import File, Image
 
 from maria_context import lead_request_context
 from maria_stt import mistral_stt_enabled_env, transcribe_voice_uazapi_sync
-from tools_maria import persist_conversation_turn_supabase, persist_uazapi_downloaded_images_sync
+from tools_maria import (
+    persist_conversation_turn_supabase,
+    persist_uazapi_downloaded_images_sync,
+    resolve_agno_user_id_for_whatsapp,
+)
 from uazapi_client import (
     build_send_menu_body,
     download_message_media_sync,
@@ -906,11 +910,22 @@ async def handle_uazapi_whatsapp_event(
         _clip(user_text, 200),
     )
 
+    chat_details: dict[str, Any] | None = None
+    if uazapi_configured():
+        try:
+            chat_details = await asyncio.to_thread(fetch_chat_details_sync, number)
+        except Exception as e:
+            logger.warning("[uazapi] chat/details (pre-arun) | digits=%s | err=%s", number, e)
+
+    memory_user_id = resolve_agno_user_id_for_whatsapp(number, chat_details) or number
+    if memory_user_id != number:
+        logger.info("[uazapi] agno user_id | memory_user_id=%s | wa_number=%s", memory_user_id, number)
+
     async with lead_request_context(canal="whatsapp", telefone_whatsapp=number):
         run_out = await agent.arun(
             input=user_text,
             session_id=session_id,
-            user_id=number,
+            user_id=memory_user_id,
             stream=False,
             images=images_kw,
             files=files_kw,
@@ -945,13 +960,6 @@ async def handle_uazapi_whatsapp_event(
         bool(menu_payload),
         _clip(reply_raw, 220),
     )
-
-    chat_details = None
-    if uazapi_configured():
-        try:
-            chat_details = await asyncio.to_thread(fetch_chat_details_sync, number)
-        except Exception as e:
-            logger.warning("[uazapi] chat/details | digits=%s | err=%s", number, e)
 
     tag_name = None
     if isinstance(chat_details, dict):

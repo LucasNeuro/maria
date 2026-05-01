@@ -63,7 +63,9 @@ UVICORN_RICH_LOG_CONFIG: dict = {
         "maria": {"handlers": ["rich"], "level": "INFO", "propagate": False},
         "tools_maria": {"handlers": ["rich"], "level": "INFO", "propagate": False},
         "uazapi_webhook": {"handlers": ["rich"], "level": "INFO", "propagate": False},
+        "uazapi_client": {"handlers": ["rich"], "level": "WARNING", "propagate": False},
         "maria_admin_api": {"handlers": ["rich"], "level": "INFO", "propagate": False},
+        "maria_os": {"handlers": ["rich"], "level": "INFO", "propagate": False},
     },
     "root": {"handlers": ["rich"], "level": "INFO"},
 }

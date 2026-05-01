@@ -1,5 +1,6 @@
 """AgentOS local — Mari (HUB Obra 10+). Rode: fastapi dev maria_os.py"""
 
+import logging
 import os
 from pathlib import Path
 
@@ -14,11 +15,18 @@ from agno.db.sqlite import SqliteDb
 from agno.os import AgentOS
 from agno.os.settings import AgnoAPISettings
 
-from tools_maria import calcular_potencial_sdr, obter_fatos_do_anuncio, registrar_lead_rascunho
+from tools_maria import (
+    calcular_potencial_sdr,
+    obter_detalhes_chat_uazapi,
+    obter_fatos_do_anuncio,
+    registrar_lead_rascunho,
+)
 from maria_admin_api import maybe_add_cors, register_maria_admin_routes
 from uazapi_webhook import handle_uazapi_whatsapp_event
 
 load_dotenv()
+
+_log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent
 SPEC_PATH = ROOT / "specs" / "maria.md"
@@ -75,6 +83,7 @@ Nunca ignores o nome. Sempre que informarem o nome (ou corrigirem), **reconhece*
 1. **`obter_fatos_do_anuncio(identificador_anuncio)`** — antes de citar números do imóvel vindos de sistema.
 2. **`registrar_lead_rascunho(...)`** — ao finalizar fluxo ou handoff; `tipo_lead`: `cliente_final` | `proprietario` | `parceiro`.
 3. **`calcular_potencial_sdr(...)`** — opcional para alinhar classificação às regras objetivas.
+4. **`obter_detalhes_chat_uazapi(numero, preview_imagem=False)`** — opcional: dados completos do contacto/chat na UAZAPI (`/chat/details`) quando precisares de nome WhatsApp, lead_*, grupo, etc.
 
 ---
 """
@@ -117,6 +126,7 @@ maria = Agent(
         obter_fatos_do_anuncio,
         registrar_lead_rascunho,
         calcular_potencial_sdr,
+        obter_detalhes_chat_uazapi,
     ],
     instructions=_instructions(),
     markdown=True,
@@ -146,7 +156,13 @@ async def uazapi_whatsapp_webhook(request: Request) -> JSONResponse:
     """Recebe eventos UAZAPI (`messages`). Configure na consola: excludeMessages `wasSentByApi`."""
     try:
         body = await request.json()
-    except Exception:
+    except Exception as exc:
+        _log.warning(
+            "[uazapi] invalid_json | client=%s | err=%s",
+            request.client.host if request.client else "-",
+            exc,
+        )
         return JSONResponse({"ok": False, "error": "invalid_json"}, status_code=400)
     status, payload = await handle_uazapi_whatsapp_event(request, maria, body)
+    _log.info("[uazapi] response | http=%s | payload=%s", status, payload)
     return JSONResponse(payload, status_code=status)

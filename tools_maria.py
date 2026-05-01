@@ -104,17 +104,36 @@ def _insert_lead_supabase(row: dict, extra: dict) -> tuple[bool, str | None]:
         return False, str(exc)
 
 
+_JSONB_MAX_BYTES = 900_000
+
+
+def truncate_jsonb_payload(data: object) -> object | None:
+    """Limita tamanho de payloads gravados em jsonb (webhook /chat/details)."""
+    if data is None:
+        return None
+    try:
+        raw = json.dumps(data, ensure_ascii=False, default=str)
+    except TypeError:
+        raw = json.dumps({"_non_serializable": str(data)[:8000]}, ensure_ascii=False)
+    if len(raw.encode("utf-8")) <= _JSONB_MAX_BYTES:
+        return data if isinstance(data, (dict, list)) else json.loads(raw)
+    return {"_truncated": True, "approx_chars": len(raw), "json_head": raw[:80000]}
+
+
 def persist_conversation_turn_supabase(
     *,
     canal: str,
     session_id: str,
-    user_external_id: str | None,
-    user_message: str,
-    assistant_reply: str,
+    phone_e164: str,
+    user_payload: dict,
+    assistant_payload: dict,
+    webhook_payload: dict | list | None = None,
+    uazapi_chat_details: dict | list | None = None,
+    tag_name: str | None = None,
     metadata: dict | None = None,
 ) -> tuple[bool, str | None]:
     """
-    Grava um turno (mensagem do cliente + resposta da Mari) em public.mari_conversation_turns.
+    Grava um turno em ``public.mari_conversation_turns`` (schema v2: jsonb + phone_e164).
     Chamado pelo webhook WhatsApp após cada resposta gerada.
     """
     if not _supabase_configured():
@@ -124,30 +143,53 @@ def persist_conversation_turn_supabase(
     except ImportError:
         return False, "pacote supabase não instalado"
 
-    um = (user_message or "").strip()
-    ar = (assistant_reply or "").strip()
-    if not um or not ar:
-        return False, "mensagem ou resposta vazia"
+    phone = "".join(c for c in (phone_e164 or "") if c.isdigit())
+    if not phone:
+        return False, "phone_e164 vazio"
+
+    ut = user_payload.get("text") if isinstance(user_payload, dict) else None
+    ar = assistant_payload.get("text") if isinstance(assistant_payload, dict) else None
+    if not (str(ut or "").strip() and str(ar or "").strip()):
+        return False, "user_payload.text ou assistant_payload.text vazio"
 
     try:
         client = create_client(
             os.environ["SUPABASE_URL"].strip(),
             os.environ["SUPABASE_SERVICE_ROLE_KEY"].strip(),
         )
-        client.table("mari_conversation_turns").insert(
-            {
-                "canal": (canal or "whatsapp").strip() or "whatsapp",
-                "session_id": (session_id or "").strip()[:2048],
-                "user_external_id": (user_external_id or "").strip()[:256] or None,
-                "user_message": um[:32000],
-                "assistant_reply": ar[:32000],
-                "metadata": metadata or {},
-            }
-        ).execute()
+        row = {
+            "canal": (canal or "whatsapp").strip() or "whatsapp",
+            "phone_e164": phone[:32],
+            "session_id": (session_id or "").strip()[:2048],
+            "tag_name": (tag_name or "").strip()[:200] or None,
+            "user_payload": truncate_jsonb_payload(user_payload) or user_payload,
+            "assistant_payload": truncate_jsonb_payload(assistant_payload) or assistant_payload,
+            "webhook_payload": truncate_jsonb_payload(webhook_payload),
+            "uazapi_chat_details": truncate_jsonb_payload(uazapi_chat_details),
+            "metadata": truncate_jsonb_payload(metadata if metadata is not None else {}) or {},
+        }
+        client.table("mari_conversation_turns").insert(row).execute()
         return True, None
     except Exception as exc:  # noqa: BLE001
         logger.warning("Supabase insert mari_conversation_turns falhou: %s", exc, exc_info=True)
         return False, str(exc)
+
+
+def obter_detalhes_chat_uazapi(numero: str, preview_imagem: bool = False) -> str:
+    """
+    UAZAPI ``POST /chat/details`` — devolve JSON com o modelo Chat completo (wa_name, lead_*, grupo, etc.).
+    Usa o mesmo token da instância que o webhook. Útil para memória / contexto antes de responder ou registar lead.
+
+    numero: telefone com país, ex. ``5511999999999`` ou JID de grupo conforme spec.
+    preview_imagem: ``true`` para URL de foto menor; ``false`` (padrão) para URL full.
+    """
+    try:
+        from uazapi_client import fetch_chat_details_sync
+
+        out = fetch_chat_details_sync((numero or "").strip(), preview_image=bool(preview_imagem))
+        return json.dumps(out, ensure_ascii=False, default=str)
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"erro": str(exc)}, ensure_ascii=False)
 
 
 def obter_fatos_do_anuncio(identificador_anuncio: str) -> str:

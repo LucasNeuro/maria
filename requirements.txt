@@ -3,6 +3,8 @@ python-dotenv>=1.0.0
 mistralai>=1.0.0
 supabase>=2.9.0
 psycopg[binary]>=3.1.0
+# Agno PostgresDb → SQLAlchemy usa o dialecto psycopg2 por defeito.
+psycopg2-binary>=2.9.9
 httpx>=0.27.0
 rich>=13.7.0
 pyyaml>=6.0

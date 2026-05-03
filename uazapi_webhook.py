@@ -91,9 +91,9 @@ def _body_summary(body: Any) -> str:
 
 def _scan_incoming_stats(body: Any) -> dict[str, int]:
     """Contagens úteis quando não há mensagem utilizável."""
-    msgs = [m for m in _collect_dicts(body) if isinstance(m, dict)]
+    msgs = _merge_inbound_message_candidates(body)
     with_text = sum(1 for m in msgs if _message_text(m))
-    from_me = sum(1 for m in msgs if m.get("fromMe"))
+    from_me = sum(1 for m in msgs if _is_from_me_or_api(m))
     by_api = sum(1 for m in msgs if m.get("wasSentByApi"))
     audioish = sum(1 for m in msgs if _is_audio_message(m))
     return {
@@ -125,13 +125,11 @@ def _digits(local_part: str) -> str:
     return "".join(c for c in local_part if c.isdigit())
 
 
-def _content_as_dict(content: Any) -> dict[str, Any] | None:
-    if content is None:
-        return None
-    if isinstance(content, dict):
-        return content
-    if isinstance(content, str):
-        s = content.strip()
+def _json_dict_if_str(val: Any) -> dict[str, Any] | None:
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str):
+        s = val.strip()
         if s.startswith("{") or s.startswith("["):
             try:
                 parsed = json.loads(s)
@@ -139,6 +137,43 @@ def _content_as_dict(content: Any) -> dict[str, Any] | None:
                 return None
             return parsed if isinstance(parsed, dict) else None
     return None
+
+
+def _unwrap_wa_content_layers(c: dict[str, Any]) -> dict[str, Any]:
+    """Remove envelopes comuns (ephemeral, view-once, legado Baileys) até ao nó com conversation/media."""
+    cur = c
+    for _ in range(16):
+        moved = False
+        for wrap in (
+            "ephemeralMessage",
+            "viewOnceMessage",
+            "viewOnceMessageV2",
+            "documentWithCaptionMessage",
+        ):
+            blk = cur.get(wrap)
+            if isinstance(blk, dict):
+                nxt = _json_dict_if_str(blk.get("message"))
+                if isinstance(nxt, dict):
+                    cur = nxt
+                    moved = True
+                    break
+        if not moved and isinstance(cur.get("message"), dict) and (
+            "key" in cur or "messageTimestamp" in cur or "messageStubType" in cur
+        ):
+            cur = cur["message"]
+            moved = True
+        if not moved:
+            break
+    return cur
+
+
+def _content_as_dict(content: Any) -> dict[str, Any] | None:
+    if content is None:
+        return None
+    c = _json_dict_if_str(content)
+    if not c:
+        return None
+    return _unwrap_wa_content_layers(c)
 
 
 def _parse_content_text(content: Any) -> str:
@@ -202,11 +237,65 @@ def _wa_message_id(msg: dict[str, Any]) -> str | None:
         v = msg.get(key)
         if isinstance(v, str) and v.strip():
             return v.strip()
+    k = msg.get("key")
+    if isinstance(k, dict):
+        v = k.get("id")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
     return None
 
 
+def _uazapi_lifted_message_dicts(body: Any) -> list[dict[str, Any]]:
+    """Mensagens por vezes vêm só em ``body.message`` ou ``body.chat.lastMessage`` (fora da árvore ``_collect_dicts``)."""
+    out: list[dict[str, Any]] = []
+    if not isinstance(body, dict):
+        return out
+    m = body.get("message")
+    if isinstance(m, dict):
+        out.append(m)
+    elif isinstance(m, list):
+        out.extend(x for x in m if isinstance(x, dict))
+    ch = body.get("chat")
+    if isinstance(ch, dict):
+        lm = ch.get("lastMessage")
+        if isinstance(lm, dict):
+            out.append(lm)
+        for ak in ("messages", "Messages", "Msgs"):
+            arr = ch.get(ak)
+            if isinstance(arr, list):
+                out.extend(x for x in arr if isinstance(x, dict))
+    return out
+
+
+def _merge_inbound_message_candidates(body: Any) -> list[dict[str, Any]]:
+    """Lift UAZAPI + achatamento; desduplica por id de mensagem quando existir."""
+    lifted = _uazapi_lifted_message_dicts(body)
+    flat = [m for m in _collect_dicts(body) if isinstance(m, dict)]
+    seen: set[str] = set()
+    merged: list[dict[str, Any]] = []
+    for m in lifted + flat:
+        mid = _wa_message_id(m)
+        if mid:
+            if mid in seen:
+                continue
+            seen.add(mid)
+        merged.append(m)
+    return merged
+
+
+def _is_from_me_or_api(msg: dict[str, Any]) -> bool:
+    if msg.get("wasSentByApi"):
+        return True
+    if msg.get("fromMe") or msg.get("FromMe") or msg.get("IsFromMe"):
+        return True
+    k = msg.get("key")
+    if isinstance(k, dict) and k.get("fromMe"):
+        return True
+    return False
+
+
 def _message_type_lower(msg: dict[str, Any]) -> str:
-    mt = msg.get("messageType")
+    mt = msg.get("messageType") or msg.get("message_type") or msg.get("type") or msg.get("Type")
     return str(mt or "").strip().lower()
 
 
@@ -234,7 +323,7 @@ def _effective_media_type(msg: dict[str, Any]) -> str:
         return "video"
     if c.get("documentMessage"):
         return "document"
-    if c.get("audioMessage") or c.get("pttMessage"):
+    if c.get("audioMessage") or c.get("pttMessage") or c.get("audio_message") or c.get("ptt_message"):
         return "ptt"
     return ""
 
@@ -254,12 +343,22 @@ def _has_visual_or_file_media(msg: dict[str, Any]) -> bool:
 
 def _is_audio_message(msg: dict[str, Any]) -> bool:
     mt = _message_type_lower(msg)
-    if mt in ("audio", "ptt", "pttmessage", "voice", "myaudio"):
+    if mt in ("audio", "ptt", "pttmessage", "voice", "myaudio", "ptv", "audiomessage"):
+        return True
+    mime_top = str(msg.get("mimetype") or msg.get("mimeType") or "").strip().lower()
+    if mime_top.startswith("audio/"):
         return True
     c = _content_as_dict(msg.get("content"))
     if not c:
         return False
-    return bool(c.get("audioMessage") or c.get("pttMessage"))
+    if c.get("audioMessage") or c.get("pttMessage") or c.get("audio_message") or c.get("ptt_message"):
+        return True
+    dm = c.get("documentMessage")
+    if isinstance(dm, dict):
+        dm_mt = str(dm.get("mimetype") or dm.get("mimeType") or "").lower()
+        if dm_mt.startswith("audio/") or "ogg" in dm_mt or "opus" in dm_mt:
+            return True
+    return False
 
 
 def _http_urls_from_message(msg: dict[str, Any]) -> list[str]:
@@ -504,10 +603,10 @@ class InboundTurn:
 def _pick_inbound_turn(body: Any) -> InboundTurn | None:
     """Última mensagem elegível por ``messageTimestamp``."""
     best: tuple[int, InboundTurn] | None = None
-    for msg in _collect_dicts(body):
+    for msg in _merge_inbound_message_candidates(body):
         if not isinstance(msg, dict):
             continue
-        if msg.get("wasSentByApi") or msg.get("fromMe"):
+        if _is_from_me_or_api(msg):
             continue
         dest = _destination_number_or_jid(msg)
         if not dest:
@@ -517,13 +616,14 @@ def _pick_inbound_turn(body: Any) -> InboundTurn | None:
         urls = _http_urls_from_message(msg)
         doc_url = _document_http_url(msg)
         media_signal = _has_visual_or_file_media(msg)
+        voice = _is_audio_message(msg)
         audio_pure = (
-            _is_audio_message(msg)
+            voice
             and not text_raw.strip()
             and not urls
             and not loc
             and not doc_url
-            and not media_signal
+            and not (media_signal and not voice)
         )
         has_actionable = (
             audio_pure
@@ -564,6 +664,18 @@ def _destination_number_or_jid(msg: dict[str, Any]) -> str | None:
         sender = msg.get("sender")
         if isinstance(sender, str) and sender.strip():
             raw = sender.strip()
+    if not raw:
+        for alt in ("from", "From", "participant", "Participant"):
+            s = msg.get(alt)
+            if isinstance(s, str) and s.strip():
+                raw = s.strip()
+                break
+    if not raw:
+        k = msg.get("key")
+        if isinstance(k, dict):
+            rj = k.get("remoteJid") or k.get("RemoteJid")
+            if isinstance(rj, str) and rj.strip():
+                raw = rj.strip()
     if not raw:
         return None
     if msg.get("isGroup"):
